@@ -1141,6 +1141,10 @@ pre.code code {
 		padding-inline: calc(var(--gutter) - 0.6rem) 2rem;
 		padding-bottom: 0.35rem;
 	}
+	/* The strip scrolls sideways on phones; keep the call to action in view rather than last. */
+	.site-nav li:has(.nav-cta) {
+		order: -1;
+	}
 }
 
 /* Homepage: the header floats over the hero and takes on its colours. */
