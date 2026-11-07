@@ -859,7 +859,9 @@ expect_status 200
 ALLOW_CURL_EXIT=""
 expect_type '^text/plain'
 expect_header cache-control 'no-store'
-expect_header x-accel-buffering '^no$'
+# Cloudflare's edge consumes X-Accel-Buffering (it never reaches the client in production), so
+# it may be missing; if anything passes it on, it must say no.
+expect_header x-accel-buffering '^(no)?$'
 expect_dynamic_headers
 expect_body $'\x1b\\[\\?25l' # the cursor hides
 expect_body 'Is Zack a dad\?'
