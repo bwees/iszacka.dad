@@ -53,6 +53,7 @@ interface Delights {
 	discordian(ymd: string): string;
 	stardate(ymd: string): number;
 	stardateText(ymd: string): string;
+	unixTimes(ymd: string): { seconds: string; milliseconds: string; nanoseconds: string } | null;
 	chineseYear(yearName: string): string;
 	calendarRows(ymd: string): Array<{ name: string; value: string }>;
 	bounceStep(
@@ -325,6 +326,19 @@ describe('other calendars', () => {
 		expect(d.stardateText('nope')).toBe('');
 	});
 
+	it('gives Unix time at midnight UTC, nanoseconds exact', () => {
+		expect(d.unixTimes('1970-01-01')).toEqual({ seconds: '0', milliseconds: '0', nanoseconds: '0' });
+		expect(d.unixTimes('2026-11-10')).toEqual({
+			seconds: '1794268800',
+			milliseconds: '1794268800000',
+			nanoseconds: '1794268800000000000',
+		});
+		// Well past Number.MAX_SAFE_INTEGER, where floats would start rounding.
+		expect(d.unixTimes('2262-04-11')?.nanoseconds).toBe('9223286400000000000');
+		expect(d.unixTimes('2026-02-30')).toBeNull();
+		expect(d.unixTimes('nope')).toBeNull();
+	});
+
 	it('names Chinese years', () => {
 		expect(d.chineseYear('bing-wu')).toBe('Fire Horse');
 		expect(d.chineseYear('ding-wei')).toBe('Fire Goat');
@@ -343,11 +357,16 @@ describe('other calendars', () => {
 			'Julian (Old Style)',
 			'Discordian',
 			'Stardate',
+			'Unix seconds',
+			'Unix milliseconds',
+			'Unix nanoseconds',
 		]);
 		const byName = Object.fromEntries(rows.map((r) => [r.name, r.value]));
 		expect(byName.Hebrew).toBe('10 Kislev 5787');
 		expect(byName['Persian (Solar Hijri)']).toContain('Aban 1405');
 		expect(byName.Chinese).toBe('Day 12 of the Tenth Month, year of the Fire Horse');
+		expect(byName['Unix seconds']).toBe('1795132800');
+		expect(byName['Unix nanoseconds']).toBe('1795132800000000000');
 		expect(d.calendarRows('')).toEqual([]);
 	});
 });

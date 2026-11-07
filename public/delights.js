@@ -4,7 +4,7 @@
 //                     unlock, listed on /achievements (the server renders an empty shell).
 //   Screensaver       home page, 60 s without input: the answer bounces round DVD-style.
 //   Other calendars   home panel: the due date in Hebrew, Islamic, Chinese, Persian, Julian,
-//                     Discordian and stardate.
+//                     Discordian, stardate and Unix time (seconds, milliseconds, nanoseconds).
 //   Night-feed mode   after YES, 02:00 to 05:00 UK time: body.night-feed, a dim red night-light.
 //   Torch mode        the answer in Morse code, full screen, at most two flashes a second.
 //   Away title        a status-appropriate tab title while hidden; it flashes on a live change.
@@ -323,6 +323,22 @@ export function stardate(ymd) {
 export function stardateText(ymd) {
 	const n = stardate(ymd);
 	return Number.isFinite(n) ? n.toFixed(1).replace('-', '−') : '';
+}
+
+/**
+ * The due date as Unix time: midnight UTC at the start of the day (the instant the stardate
+ * counts from too), in whole seconds, milliseconds and nanoseconds. Strings, not numbers:
+ * nanoseconds outgrow Number.MAX_SAFE_INTEGER, so they're done in BigInt.
+ */
+export function unixTimes(ymd) {
+	const p = ymdParts(ymd);
+	if (!p) return null;
+	const ms = Date.UTC(p.y, p.m - 1, p.d);
+	return {
+		seconds: String(ms / 1000),
+		milliseconds: String(ms),
+		nanoseconds: (BigInt(ms) * 1_000_000n).toString(),
+	};
 }
 
 const STEMS = { jia: 'Wood', yi: 'Wood', bing: 'Fire', ding: 'Fire', wu: 'Earth', ji: 'Earth', geng: 'Metal', xin: 'Metal', ren: 'Water', gui: 'Water' };
@@ -1055,6 +1071,10 @@ export function calendarRows(ymd) {
 	tryRow('Julian (Old Style)', () => julianText(ymd));
 	tryRow('Discordian', () => discordian(ymd));
 	tryRow('Stardate', () => stardateText(ymd));
+	const unix = unixTimes(ymd);
+	tryRow('Unix seconds', () => unix?.seconds);
+	tryRow('Unix milliseconds', () => unix?.milliseconds);
+	tryRow('Unix nanoseconds', () => unix?.nanoseconds);
 	return rows;
 }
 
@@ -1090,7 +1110,7 @@ function renderCalendars() {
 		h(
 			'p',
 			{ class: 'tiny muted' },
-			"The Hebrew, Islamic, Persian and Chinese dates come from your browser's own calendars (an Islamic month can begin a day earlier or later than the tables say, moon permitting). Julian and Discordian are worked out here. The stardate uses the common fan formula for TNG-era stardates (1,000 a year, from stardate 0 at the start of 2323, as popularised by TrekGuide), hence the minus sign. The due date remains approximate in every calendar known to science.",
+			"The Hebrew, Islamic, Persian and Chinese dates come from your browser's own calendars (an Islamic month can begin a day earlier or later than the tables say, moon permitting). Julian and Discordian are worked out here. The stardate uses the common fan formula for TNG-era stardates (1,000 a year, from stardate 0 at the start of 2323, as popularised by TrekGuide), hence the minus sign. The Unix times count from 1 January 1970 to midnight UTC at the start of the due date. The due date remains approximate in every calendar known to science.",
 		),
 	);
 	panel.hidden = false;

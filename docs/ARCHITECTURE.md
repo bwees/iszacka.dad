@@ -306,8 +306,9 @@ data-due-date>` (a MutationObserver), which app.js updates for the WebSocket and
   of the other wall) fires a small local burst and an achievement. Any input exits.
 - **Other calendars** (home panel CH-16, last on the grid, hidden without a due date):
   Hebrew, Islamic (Umm al-Qura), Persian and Chinese via the browser's `Intl` calendars;
-  Julian, Discordian and a TNG-style stardate (1,000 a year from 2323, TrekGuide's fan
-  formula) computed.
+  Julian, Discordian, a TNG-style stardate (1,000 a year from 2323, TrekGuide's fan
+  formula) and Unix seconds, milliseconds and nanoseconds (midnight UTC at the start of the
+  due date; nanoseconds in BigInt) computed.
 - **Night-feed mode**: after YES, 02:00 to 05:00 Europe/London (computed without `Intl`),
   `body.night-feed` swaps the tokens for a dim red night-light and shows a "shh" note.
 - **Torch mode** (a button in the Instruments panel): a photosensitivity notice, then full

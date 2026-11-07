@@ -330,6 +330,7 @@ dialog.dl-dialog::backdrop {
 	font-stretch: 100%;
 	font-size: 1rem;
 	line-height: 1.3;
+	overflow-wrap: anywhere; /* nineteen digits of nanoseconds on a narrow phone */
 }
 
 /* ─── Night-feed mode: after YES, 02:00 to 05:00 UK time ────────────────── */
