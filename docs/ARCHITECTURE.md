@@ -48,10 +48,11 @@ Key APIs:
 `c.get('state')` holds the `SiteState` for the current request, except on the routes in
 `STATELESS_PATHS` (`src/index.ts`: `/api/resend/webhook`, `/api/push/key`, `/api/push/subscribe`,
 `/api/push/unsubscribe`, `/robots.txt`, `/.well-known/security.txt`) and WebSocket upgrades to
-`/ws`, which skip the state read and get no `X-Is-Zack-A-Dad` header; call `getState(env)` there if
+`/ws` and `/live`, which skip the state read and get no `X-Is-Zack-A-Dad` header; call `getState(env)` there if
 you need it. Root middleware also counts checks (one fire-and-forget RPC to the WaitingRoom),
-serves curl ASCII on `/`, redirects `www.`, and sets the `X-Is-Zack-A-Dad`, `Server-Timing`, CSP and
-security headers. A route can override a default header by setting it first. `/embed` needs
+serves curl ASCII on `/`, redirects `www.`, and sets the `X-Is-Zack-A-Dad`, `X-Nappies-Changed`
+(`0`, after YES `uncountable`), `X-Sleep-Remaining` (`plenty (for now)`, after YES `0`),
+`Server-Timing`, CSP and security headers. A route can override a default header by setting it first. `/embed` needs
 `frame-ancestors *`.
 
 Bindings (`Env`): `DB` (D1), `WAITING_ROOM` (DO), `ANNOUNCE` (Workflow `iszacka-dad-announce`),
@@ -197,6 +198,17 @@ tallies; no extra D1 writes, and nothing per person beyond a country code):
 "who just checked" panels, and milestone toasts. The map (`/world-map.svg`, Natural Earth, public
 domain, ~66 KB) is fetched only when scrolled near, then shaded from `/api/countries`.
 
+**Terminals (`/live`, terminal agent).** `curl -N /live` (a `text/plain` stream) and
+`websocat wss://…/live` (a hibernatable WebSocket tagged `terminal`) are routed into the same
+WaitingRoom, which keeps them next to the SSE streams and browser sockets but sends them
+whole-screen ANSI frames (`lib/ascii-live.ts`), never JSON; whatever a terminal socket sends is
+ignored. Every broadcast (state, update, viewers, vibes, checks) redraws them at once, bursts
+coalesced to one redraw per 250 ms; a clock tick on the DO alarm every 5 s runs only while a
+terminal is connected. Each frame is rendered once and the same bytes go to every terminal.
+Caps: 50 terminals at once (503 + `Retry-After`), 3 per client, 15 minutes each (then a goodbye
+frame). The flip to YES plays about 10 s of fireworks from a timer (once), then a static
+celebration. Browsers asking for `/live` get an HTML how-to with a preview of the frame.
+
 ## Ownership (agents edit only their files; new files only under their own names/prefixes)
 
 | Agent | Files | Features |
@@ -214,6 +226,7 @@ domain, ~66 KB) is fetched only when scrolled near, then shaded from `/api/count
 | social | `src/routes/social.ts`, `src/lib/social.ts`, `src/lib/dadcon.ts`, `public/social.js`, `public/social.css`, `public/world-map.svg`, `public/world-map.LICENSE.txt`, the social parts of `src/do/waiting-room.ts`, `test/social-*` | DADCON, live check feed, live world map, milestones, global anxiety meter (home panels CH-12 to CH-15) |
 | corporate | `src/routes/corporate.ts`, `src/lib/corporate.ts`, `src/lib/stork.ts`, `public/stork.js`, `public/corporate.css`, `migrations/0012_stork.sql`, `test/corporate-*`, `test/stork-*` | press kit, privacy policy + terms (kept accurate by tests against the schema and the CSS), pigeon / smoke signal / fax on /everything, Catch the Stork + leaderboard |
 | delights | `public/delights.js`, `public/delights.css`, `src/routes/delights.ts`, `test/delights-*` | browser-only toys: achievements, screensaver, the due date in other calendars, night-feed mode, torch mode, away title |
+| terminal | `src/routes/terminal.ts`, `src/lib/ascii-live.ts`, `src/lib/terminal.ts`, `src/lib/formats.ts`, `public/grandad.js`, the terminal parts of `src/do/waiting-room.ts` (+ `waiting-room-protocol.ts`) and `src/lib/ascii.ts`, the formats in `src/routes/api.ts`, `test/terminal-*` | `curl -N /live` dashboard (+ websocat), the answer in every format, `/.plan`, `/is-zack-a-grandad`, the `X-Nappies-Changed` / `X-Sleep-Remaining` headers |
 
 Reserved migration files, if you need schema additions (prefer not to): `0002_realtime`,
 `0003_email` (used: `email_sends`), `0004_push`, `0005_admin`, `0006_community`, `0007_fun`,
@@ -247,7 +260,8 @@ Reserved migration files, if you need schema additions (prefer not to): `0002_re
 - `lib/community.ts`: `getReadiness(env) → Readiness`
 - `lib/admin.ts`: `requireAdmin` middleware, `isAdmin(c)`, `renderAdminPage(c, {title, body, status})`
 - `lib/i18n.ts`: `TRANSLATIONS`, `answerInLanguage(acceptLanguage, status)`
-- `lib/ascii.ts`: `isTerminalClient(ua)`, `renderAscii(state, {checks})`
+- `lib/ascii.ts`: `isTerminalClient(ua)`, `renderAscii(state, {checks})`, `asciiPoster({kicker, word, status, facts})`
+- `lib/formats.ts`: `FORMATS`, `renderFormat(ext, statusDocument, selfUrl)`, `negotiateFormat(accept)`
 - Fragments for `/everything`: `emailSignupForm(c)` (`routes/subscribe.ts`), `pushWidget(c)` (needs
   `/push.js`) (`routes/push.ts`), `webhookForm(c)` (`routes/webhooks.ts`), `pigeonForm()`,
   `smokeSignalForm()`, `faxForm()` (`routes/corporate.ts`)
@@ -268,6 +282,7 @@ Reserved migration files, if you need schema additions (prefer not to): `0002_re
 | social | `/api/countries` (checks per country, cached ~60 s, CORS `*`); static `/social.js`, `/social.css`, `/world-map.svg`, `/world-map.LICENSE.txt` |
 | corporate | `/press`, `/privacy`, `/terms`, `/pigeon`, `/smoke-signal`, `/fax` (POST: a result page, nothing read or stored; GET redirects back to the method on /everything), `/stork`, `/api/stork/start` (POST), `/api/stork/score` (POST), `/api/stork/scores`; static `/stork.js`, `/corporate.css` |
 | delights | `/achievements`; static `/delights.js`, `/delights.css` |
+| terminal | `/live` (curl stream, WebSocket, or an HTML how-to), `/.plan`, `/is-zack-a-grandad` (HTML, or ASCII for curl), `/api/formats`, `/api/status.{xml,yaml,toml,csv,md,html,ini,sql,tap,morse,braille,binary,hex,emoji,nato,base64,rot13}` (+ Accept negotiation on `/api/status`); static `/grandad.js` |
 
 Email addresses: `stork@iszacka.dad` sends notifications and `answer@iszacka.dad` sends
 auto-replies, both through Resend. Resend receives any `*@iszacka.dad`, and the Worker auto-replies;

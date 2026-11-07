@@ -847,6 +847,125 @@ if ! printf '%s' "$FIRST_EVENT" | jq -e --arg s "$CURRENT" '.type == "hello" and
 fi
 finish
 
+# ─── Terminal: /live, the answer in every format, /.plan, the grandad estimate ──
+
+section "Terminal"
+
+begin "curl -N /live streams a live dashboard"
+# The stream never ends (until 15 minutes), so curl stops it (28); 18 is a closed stream.
+ALLOW_CURL_EXIT="18 28"
+request GET /live --no-buffer --max-time 3 --user-agent 'curl/8.11.1'
+expect_status 200
+ALLOW_CURL_EXIT=""
+expect_type '^text/plain'
+expect_header cache-control 'no-store'
+expect_header x-accel-buffering '^no$'
+expect_dynamic_headers
+expect_body $'\x1b\\[\\?25l' # the cursor hides
+expect_body 'Is Zack a dad\?'
+expect_body 'London'
+expect_no_body_i '<html|<!doctype'
+finish
+
+# shellcheck disable=SC2016 # JavaScript, not shell.
+LIVE_WS_SCRIPT='
+const [url] = process.argv.slice(1);
+const fail = (message) => { console.error(message); process.exit(1); };
+const timer = setTimeout(() => fail("timed out waiting for a frame"), 10000);
+const ws = new WebSocket(url);
+ws.addEventListener("error", (event) => fail(`WebSocket error${event.message ? `: ${event.message}` : ""}`));
+ws.addEventListener("message", (event) => {
+	const frame = String(event.data);
+	if (!frame.startsWith("\u001b[")) return fail(`first message is not an ANSI frame: ${frame.slice(0, 60)}`);
+	if (!frame.includes("Is Zack a dad?")) return fail("the frame does not ask the question");
+	clearTimeout(timer);
+	console.log(`frame of ${frame.length} characters`);
+	ws.close();
+	setTimeout(() => process.exit(0), 50);
+});
+'
+begin "WebSocket /live sends ANSI frames (websocat)"
+if LIVE_WS_OUT=$(node -e "$LIVE_WS_SCRIPT" "$WS_BASE/live" 2>&1); then
+	CHECK="$CHECK ($LIVE_WS_OUT)"
+else
+	problem "$LIVE_WS_OUT"
+fi
+finish
+
+html_page /live 'curl -N'
+html_page /is-zack-a-grandad 'grandad'
+asset /grandad.js 'javascript'
+
+begin "curl /is-zack-a-grandad gets ASCII: not yet"
+request GET /is-zack-a-grandad --user-agent 'curl/8.11.1'
+expect_status 200
+expect_type '^text/plain'
+expect_dynamic_headers
+expect_body 'Is Zack a grandad\?'
+expect_body_i 'give or take|unknown'
+expect_no_body_i '<html|<!doctype'
+finish
+
+begin "GET /.plan is a Unix plan file"
+request GET /.plan
+expect_status 200
+expect_type '^text/plain'
+expect_dynamic_headers
+expect_body '^Plan: '
+if [[ $CURRENT == yes ]]; then expect_body 'New plan: sleep'; else expect_body 'Progress: '; fi
+if [[ $CURRENT == yes ]]; then
+	expect_header x-nappies-changed '^uncountable$'
+	expect_header x-sleep-remaining '^0$'
+else
+	expect_header x-nappies-changed '^0$'
+	expect_header x-sleep-remaining '^plenty \(for now\)$'
+fi
+finish
+
+json_endpoint /api/formats '(.formats | length >= 15) and all(.formats[]; (.ext | type == "string") and (.url | type == "string"))'
+
+for path in /api/status.xml /api/status.yaml /api/status.toml /api/status.csv /api/status.md /api/status.html \
+	/api/status.ini /api/status.sql /api/status.tap /api/status.morse /api/status.braille /api/status.binary \
+	/api/status.hex /api/status.emoji /api/status.nato /api/status.base64 /api/status.rot13; do
+	begin "GET $path"
+	request GET "$path"
+	expect_status 200
+	expect_header cache-control 'no-store'
+	expect_dynamic_headers
+	expect_nonempty
+	case $path in
+		*.xml) expect_type '^application/xml'; expect_xml '<status[[:space:]]' ;;
+		*.yaml) expect_type 'yaml'; expect_body "^status: \"$CURRENT\"" ;;
+		*.csv) expect_type '^text/csv'; expect_body '^is_zack_a_dad,status,' ;;
+		*.html) expect_type '^text/html'; expect_csp ;;
+		*.morse)
+			case $CURRENT in
+				no) expect_body '^-\. ---$' ;;
+				soon) expect_body '^-\. --- - / -\.-- \. -$' ;;
+				yes) expect_body '^-\.-- \. \.\.\.$' ;;
+			esac
+			;;
+		*.nato) expect_body '^(NOVEMBER|YANKEE) ' ;;
+		*) expect_type '^(text|application)/' ;;
+	esac
+	finish
+done
+
+begin "GET /api/status negotiates: Accept: application/yaml gets YAML"
+request GET /api/status --header 'Accept: application/yaml'
+expect_status 200
+expect_type 'yaml'
+expect_header vary 'Accept'
+expect_body "^status: \"$CURRENT\""
+finish
+
+begin "GET /api/status still gives browsers JSON"
+request GET /api/status --header "Accept: $HTML_ACCEPT"
+expect_status 200
+expect_type 'json'
+expect_json '.status == $s' --arg s "$CURRENT"
+finish
+
 # ─── Notifications ─────────────────────────────────────────────────────────────
 
 section "Notifications"

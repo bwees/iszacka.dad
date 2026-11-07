@@ -40,6 +40,14 @@
 // (saved only when the object may be about to hibernate). The last broadcast viewer count is kept in
 // memory on purpose: after a wake or restart the first alarm always re-broadcasts it, so
 // clients that reconnected mid-count are corrected.
+//
+// Terminals (GET /live: `curl -N` streams, and hibernatable WebSockets tagged 'terminal' for
+// websocat) get whole-screen ANSI frames instead of JSON (src/lib/ascii-live.ts). Every
+// broadcast redraws them at once (bursts coalesced to one redraw per TERMINAL_MIN_REDRAW_MS),
+// and while any terminal is connected, and only then, the alarm also ticks every
+// TERMINAL_TICK_MS for the clocks. Each frame is rendered once and the same bytes go to every
+// terminal. A terminal gets TERMINAL_MAX_MS, then a goodbye frame; MAX_TERMINALS at once. The
+// flip to YES plays FIREWORKS_MS of fireworks (a timer, not the alarm: it happens once).
 
 import { DurableObject } from 'cloudflare:workers';
 import {
@@ -52,19 +60,31 @@ import {
 	parseCheckEvent,
 	tallyCheck,
 } from '../lib/counters';
+import { LIVE_FALLBACK_GOODBYE, LIVE_PREAMBLE, type LatestUpdate, type LiveModel, renderFinalFrame, renderLiveFrame } from '../lib/ascii-live';
 import { randomToken, rateLimitSubject, sha256Hex } from '../lib/security';
 import { milestoneAtOrBelow, milestoneReached, type PulseOutput, SocialPulse } from '../lib/social';
 import { getSetting, getState } from '../lib/state';
 import { nowIso } from '../lib/time';
+import { listUpdates } from '../lib/updates';
 import type { AnxietyReading, LiveMessage, SiteState } from '../types';
 import {
 	CHECK_RETRY_MS,
 	CHECK_TICK_MS,
 	CHECKS_BROADCAST_MS,
 	checksDue,
+	FIREWORKS_FRAME_MS,
+	FIREWORKS_MS,
 	frameBudget,
 	heartbeatText,
+	isFreshFlip,
+	MAX_TERMINAL_PENDING,
+	MAX_TERMINALS,
+	MAX_TERMINALS_PER_CLIENT,
 	mergeVibeCounts,
+	nextTerminalTick,
+	TERMINAL_MIN_REDRAW_MS,
+	TERMINAL_TAG,
+	terminalExpired,
 	parseClientMessage,
 	parseVibe,
 	PING_FRAME,
@@ -92,6 +112,8 @@ interface SocketAttachment {
 	frames: number;
 	/** Social: the client's country (ISO 3166-1 alpha-2, or 'T1'), so its vibes can float from it on the map. */
 	country?: string;
+	/** A terminal (GET /live): gets ANSI frames, never JSON, and its messages are ignored. */
+	terminal?: true;
 }
 
 interface StreamClient {
@@ -100,6 +122,12 @@ interface StreamClient {
 	pending: number;
 	open: boolean;
 	openedAt: number;
+}
+
+/** A `curl -N /live` stream. */
+interface TerminalClient extends StreamClient {
+	/** The client's terminal tag (see #clientTag), for the per-client cap; null without an IP. */
+	tag: string | null;
 }
 
 /** Viewer-count broadcasts are coalesced into at most one per this interval. */
@@ -149,6 +177,17 @@ const TEXT_HEADERS: Record<string, string> = {
 	'Cache-Control': 'no-store',
 };
 
+/** Broadcasts that change what the terminal dashboard shows (social ones like checkfeed don't). */
+const TERMINAL_REDRAW_TYPES: ReadonlySet<LiveMessage['type']> = new Set(['state', 'update', 'viewers', 'vibes', 'checks']);
+
+/** `curl -N /live`: unbuffered, unmodified, never cached. */
+const TERMINAL_HEADERS: Record<string, string> = {
+	'Content-Type': 'text/plain; charset=utf-8',
+	'Cache-Control': 'no-store, no-transform',
+	'X-Accel-Buffering': 'no',
+	'X-Content-Type-Options': 'nosniff',
+};
+
 export class WaitingRoom extends DurableObject<Env> {
 	readonly #encoder = new TextEncoder();
 	readonly #streams = new Set<StreamClient>();
@@ -191,6 +230,26 @@ export class WaitingRoom extends DurableObject<Env> {
 	/** Social: the last milestone celebrated; null until read from storage. */
 	#lastMilestone: number | null = null;
 
+	// Terminals (GET /live).
+	readonly #terminals = new Set<TerminalClient>();
+	/** Open terminal WebSockets; null when it needs recounting (after a wake, or one went away). */
+	#terminalSockets: number | null = null;
+	/** The newest update, for the dashboard; undefined until read from D1 since this object woke. */
+	#latest: LatestUpdate | null | undefined = undefined;
+	/** Bumped by every update broadcast, so a D1 read can tell it raced one. */
+	#latestSeq = 0;
+	/** Frames drawn (moves the hazard tape), and when the last one was. */
+	#terminalFrames = 0;
+	#terminalDrawnAt = 0;
+	/** A coalesced redraw waiting to happen. */
+	#terminalRedraw: ReturnType<typeof setTimeout> | null = null;
+	/** When the next clock tick is due (0: none scheduled since this object woke). */
+	#terminalTickAt = 0;
+	/** The fireworks: when they started, and the timer for the next frame. */
+	#fireworks: { start: number; timer: ReturnType<typeof setTimeout> | null } | null = null;
+	/** statusChangedAt of the last flip to YES celebrated, so a re-broadcast doesn't celebrate twice. */
+	#celebrated: string | null = null;
+
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		const { sql, kv } = ctx.storage;
@@ -208,15 +267,21 @@ export class WaitingRoom extends DurableObject<Env> {
 		ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(PING_FRAME, PONG_FRAME));
 	}
 
-	/** Handles WebSocket upgrades (/ws) and SSE (/api/stream), forwarded by src/routes/live.ts. */
+	/**
+	 * Handles WebSocket upgrades (/ws) and SSE (/api/stream), forwarded by src/routes/live.ts,
+	 * and terminals (/live: a stream, or a WebSocket), forwarded by src/routes/terminal.ts.
+	 */
 	override async fetch(request: Request): Promise<Response> {
-		if ((request.headers.get('Upgrade') ?? '').toLowerCase() === 'websocket') return this.#acceptSocket(request);
 		const { pathname } = new URL(request.url);
+		if ((request.headers.get('Upgrade') ?? '').toLowerCase() === 'websocket') {
+			return pathname === '/live' ? this.#acceptTerminalSocket(request) : this.#acceptSocket(request);
+		}
 		if (pathname === '/api/stream') {
 			if (request.method === 'GET') return this.#openStream();
 			if (request.method === 'HEAD') return new Response(null, { headers: SSE_HEADERS });
 		}
-		return new Response('Not found. The waiting room only does /ws and /api/stream.', { status: 404, headers: TEXT_HEADERS });
+		if (pathname === '/live' && request.method === 'GET') return this.#openTerminal(request);
+		return new Response('Not found. The waiting room only does /ws, /api/stream and /live.', { status: 404, headers: TEXT_HEADERS });
 	}
 
 	/** RPC: send a message to every connected client. */
@@ -270,7 +335,7 @@ export class WaitingRoom extends DurableObject<Env> {
 		return {
 			viewers: this.#viewerCount(),
 			sockets: this.#socketCount(),
-			streams: this.#streams.size,
+			streams: this.#streams.size + this.#terminals.size,
 			vibes: this.#vibeTotal,
 			vibesByEmoji: rankVibes(mergeVibeCounts(rows, pending)),
 			openSince: typeof openSince === 'string' ? openSince : null,
@@ -282,6 +347,11 @@ export class WaitingRoom extends DurableObject<Env> {
 		const budget = frameBudget({ start: attachment.frameWindowStart, frames: attachment.frames }, Date.now());
 		if (!budget.allowed) {
 			this.#close(ws, 1008, 'Too many messages.');
+			return;
+		}
+		if (attachment.terminal) {
+			// websocat sends whatever is typed. Typing at the dashboard changes nothing, so it's ignored.
+			ws.serializeAttachment({ ...attachment, frameWindowStart: budget.start, frames: budget.frames } satisfies SocketAttachment);
 			return;
 		}
 		const msg = parseClientMessage(message);
@@ -306,6 +376,7 @@ export class WaitingRoom extends DurableObject<Env> {
 			// Already closing.
 		}
 		this.#sockets = null;
+		this.#terminalSockets = null;
 		this.ctx.waitUntil(this.#viewersChanged());
 	}
 
@@ -316,6 +387,7 @@ export class WaitingRoom extends DurableObject<Env> {
 			// Already closed (the runtime may have replied to the close frame itself).
 		}
 		this.#sockets = null;
+		this.#terminalSockets = null;
 		await this.#viewersChanged();
 	}
 
@@ -327,6 +399,7 @@ export class WaitingRoom extends DurableObject<Env> {
 			// Already gone.
 		}
 		this.#sockets = null;
+		this.#terminalSockets = null;
 		await this.#viewersChanged();
 	}
 
@@ -334,6 +407,7 @@ export class WaitingRoom extends DurableObject<Env> {
 		// This alarm is no longer pending; and recount sockets now and then, in case one went quietly.
 		this.#alarmAt = null;
 		this.#sockets = null;
+		this.#terminalSockets = null;
 		try {
 			this.#flushVibes();
 			this.#expireStreams();
@@ -344,6 +418,7 @@ export class WaitingRoom extends DurableObject<Env> {
 			}
 			await this.#checksAlarm();
 			await this.#socialTick();
+			await this.#terminalAlarm();
 			if (this.#streams.size > 0) {
 				this.#heartbeat();
 				await this.#ensureAlarm(Date.now() + HEARTBEAT_MS);
@@ -545,28 +620,305 @@ export class WaitingRoom extends DurableObject<Env> {
 		for (const client of this.#streams) this.#write(client, frame);
 	}
 
+	// ── Terminals (GET /live) ─────────────────────────────────────────────────
+
+	/** `curl -N /live`: a stream of whole-screen frames. */
+	async #openTerminal(request: Request): Promise<Response> {
+		const tag = await this.#terminalTag(request);
+		if (!(await this.#loadTerminalModel())) return unavailable();
+		const refused = this.#refuseTerminal(tag);
+		if (refused) return refused;
+
+		const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+		const client: TerminalClient = { writer: writable.getWriter(), pending: 0, open: true, openedAt: Date.now(), tag };
+		this.#terminals.add(client);
+		// Fires when the reader goes away (Ctrl-C), however that surfaces.
+		client.writer.closed.then(
+			() => this.#dropTerminal(client),
+			() => this.#dropTerminal(client),
+		);
+		this.#writeTerminal(client, this.#encoder.encode(`${LIVE_PREAMBLE}${this.#terminalFrame(Date.now())}`));
+		await this.#terminalJoined();
+		return new Response(readable, { headers: TERMINAL_HEADERS });
+	}
+
+	/** `websocat wss://…/live`: the same frames as text messages, on a hibernatable socket. */
+	async #acceptTerminalSocket(request: Request): Promise<Response> {
+		if (this.#socketCount() >= MAX_SOCKETS) return roomFull();
+		const tag = await this.#terminalTag(request);
+		if (!(await this.#loadTerminalModel())) return unavailable();
+		const refused = this.#refuseTerminal(tag);
+		if (refused) return refused;
+
+		const { 0: client, 1: server } = new WebSocketPair();
+		this.ctx.acceptWebSocket(server, tag ? [TERMINAL_TAG, tag] : [TERMINAL_TAG]);
+		if (this.#sockets !== null) this.#sockets += 1;
+		if (this.#terminalSockets !== null) this.#terminalSockets += 1;
+		const now = Date.now();
+		server.serializeAttachment({ connectedAt: now, vibes: [], frameWindowStart: now, frames: 0, terminal: true } satisfies SocketAttachment);
+		this.#send(server, `${LIVE_PREAMBLE}${this.#terminalFrame(now)}`);
+		await this.#terminalJoined();
+		return new Response(null, { status: 101, webSocket: client });
+	}
+
+	/** The per-client tag for terminals (distinct from browser sockets' tags, so caps don't mix). */
+	async #terminalTag(request: Request): Promise<string | null> {
+		const tag = await this.#clientTag(request);
+		return tag ? `t${tag}` : null;
+	}
+
+	/** Checked after every await, right before accepting, so concurrent connects can't overshoot. */
+	#refuseTerminal(tag: string | null): Response | null {
+		if (this.#terminalCount() >= MAX_TERMINALS) return terminalsFull();
+		if (tag) {
+			let mine = this.ctx.getWebSockets(tag).length;
+			for (const client of this.#terminals) if (client.tag === tag) mine++;
+			if (mine >= MAX_TERMINALS_PER_CLIENT) return tooManyTerminals();
+		}
+		return null;
+	}
+
+	async #terminalJoined(): Promise<void> {
+		// Everyone's viewer count changes: the alarm sends it, which redraws every terminal.
+		this.#lastViewers = null;
+		await this.#viewersChanged();
+		await this.#ensureTerminalTick();
+		// Joined during the fireworks with nobody else watching: the show goes on.
+		if (this.#fireworks && !this.#fireworks.timer) this.#fireworksFrame();
+	}
+
+	#terminalCount(): number {
+		return this.#terminals.size + this.#terminalSocketCount();
+	}
+
+	#terminalSocketCount(): number {
+		this.#terminalSockets ??= this.#terminalSocketList().length;
+		return this.#terminalSockets;
+	}
+
+	/** Open terminal WebSockets (at most MAX_TERMINALS, so walking them is cheap). */
+	#terminalSocketList(): WebSocket[] {
+		return this.ctx
+			.getWebSockets(TERMINAL_TAG)
+			.filter((ws) => ws.readyState !== WS_CLOSING && ws.readyState !== WS_CLOSED && readAttachment(ws).terminal === true);
+	}
+
+	/** Make sure the state, the check total and the newest update are in memory, then the model. */
+	async #loadTerminalModel(): Promise<LiveModel | null> {
+		if (!this.#knownState) await this.#currentState();
+		if (this.#storedChecks === null && Date.now() >= this.#checksRetryAt) await this.#syncChecks();
+		if (this.#latest === undefined) await this.#loadLatest();
+		return this.#terminalModel();
+	}
+
+	/** What the dashboard shows, from memory only; null if the answer isn't known. */
+	#terminalModel(): LiveModel | null {
+		const state = this.#knownState;
+		if (!state) return null;
+		return {
+			state,
+			viewers: this.#viewerCount(),
+			terminals: this.#terminalCount(),
+			vibes: this.#vibeTotal,
+			checks: this.#knownChecks(),
+			latest: this.#latest ?? null,
+		};
+	}
+
+	async #loadLatest(): Promise<void> {
+		const before = this.#latestSeq;
+		try {
+			const [update] = await listUpdates(this.env, { limit: 1 });
+			// An update broadcast during the read is newer: never let the read overwrite it.
+			if (this.#latestSeq === before) this.#latest = update ? { title: update.title, createdAt: update.createdAt } : null;
+		} catch (err) {
+			console.error('waiting room: latest update lookup failed', err);
+		}
+	}
+
+	#terminalFrame(now: number, bell = false): string {
+		const model = this.#terminalModel();
+		if (!model) return '';
+		return renderLiveFrame(model, { now, frame: this.#terminalFrames, fireworksAt: this.#fireworksAt(now), bell });
+	}
+
+	/** Render one frame and send the same bytes to every terminal. */
+	#drawTerminals(bell = false): void {
+		if (this.#terminalRedraw) {
+			clearTimeout(this.#terminalRedraw);
+			this.#terminalRedraw = null;
+		}
+		const now = Date.now();
+		this.#terminalFrames++;
+		this.#terminalDrawnAt = now;
+		const frame = this.#terminalFrame(now, bell);
+		if (frame) this.#sendTerminals(frame);
+	}
+
+	#sendTerminals(text: string): void {
+		if (this.#terminals.size > 0) {
+			const bytes = this.#encoder.encode(text);
+			for (const client of [...this.#terminals]) this.#writeTerminal(client, bytes);
+		}
+		if (this.#terminalSocketCount() > 0) for (const ws of this.#terminalSocketList()) this.#send(ws, text);
+	}
+
+	#writeTerminal(client: TerminalClient, bytes: Uint8Array): void {
+		if (!client.open) return;
+		if (client.pending >= MAX_TERMINAL_PENDING) {
+			this.#dropTerminal(client);
+			return;
+		}
+		client.pending++;
+		client.writer.write(bytes).then(
+			() => {
+				client.pending--;
+			},
+			() => this.#dropTerminal(client),
+		);
+	}
+
+	#dropTerminal(client: TerminalClient): void {
+		if (!client.open) return;
+		client.open = false;
+		this.#terminals.delete(client);
+		client.writer.abort('dropped').catch(() => {
+			// Already errored: that's usually why we're here.
+		});
+		this.ctx.waitUntil(this.#viewersChanged());
+	}
+
+	/** A broadcast arrived: redraw now, or once the last redraw is TERMINAL_MIN_REDRAW_MS old. */
+	#terminalsChanged(): void {
+		if (this.#fireworks?.timer || this.#terminalCount() === 0) return; // the fireworks draw every frame anyway
+		const wait = this.#terminalDrawnAt + TERMINAL_MIN_REDRAW_MS - Date.now();
+		if (wait <= 0) {
+			this.#drawTerminals();
+			return;
+		}
+		this.#terminalRedraw ??= setTimeout(() => {
+			this.#terminalRedraw = null;
+			this.#drawTerminals();
+		}, wait);
+	}
+
+	async #ensureTerminalTick(): Promise<void> {
+		const now = Date.now();
+		if (this.#terminalTickAt <= now) this.#terminalTickAt = nextTerminalTick(now);
+		await this.#ensureAlarmSafely(this.#terminalTickAt);
+	}
+
+	/** The alarm's part: the clock tick and the 15-minute goodbyes, only while terminals exist. */
+	async #terminalAlarm(): Promise<void> {
+		if (this.#terminalCount() === 0) return;
+		const now = Date.now();
+		if (now >= this.#terminalTickAt - 50) {
+			this.#terminalTickAt = nextTerminalTick(now);
+			// After a wake only hibernated sockets remain, and memory is empty: read what's missing.
+			await this.#loadTerminalModel();
+			this.#expireTerminals(Date.now());
+			// Skipped if a broadcast (this alarm's viewer count, say) has only just drawn one.
+			const fresh = Date.now() - this.#terminalDrawnAt < TERMINAL_MIN_REDRAW_MS;
+			if (this.#terminalCount() > 0 && !this.#fireworks?.timer && !fresh) this.#drawTerminals();
+		}
+		if (this.#terminalCount() > 0) await this.#ensureAlarm(this.#terminalTickAt);
+	}
+
+	/** Say goodbye to terminals that have had their time, and hang up. */
+	#expireTerminals(now: number): void {
+		const streams = [...this.#terminals].filter((client) => terminalExpired(client.openedAt, now));
+		const sockets = this.#terminalSocketCount() > 0 ? this.#terminalSocketList().filter((ws) => terminalExpired(readAttachment(ws).connectedAt, now)) : [];
+		if (streams.length === 0 && sockets.length === 0) return;
+		const model = this.#terminalModel();
+		const goodbye = model ? renderFinalFrame(model, { now, frame: this.#terminalFrames }) : LIVE_FALLBACK_GOODBYE;
+		if (streams.length > 0) {
+			const bytes = this.#encoder.encode(goodbye);
+			for (const client of streams) {
+				this.#writeTerminal(client, bytes);
+				client.open = false;
+				this.#terminals.delete(client);
+				client.writer.close().catch(() => {});
+			}
+		}
+		for (const ws of sockets) {
+			this.#send(ws, goodbye);
+			try {
+				ws.close(1000, 'Time is up. Run it again.');
+			} catch {
+				// Already closing.
+			}
+		}
+		if (sockets.length > 0) {
+			this.#sockets = null;
+			this.#terminalSockets = null;
+		}
+		this.ctx.waitUntil(this.#viewersChanged());
+	}
+
+	/** Milliseconds into the fireworks, or undefined when there are none (or it's no longer yes). */
+	#fireworksAt(now: number): number | undefined {
+		const fireworks = this.#fireworks;
+		if (!fireworks) return undefined;
+		const t = now - fireworks.start;
+		return t >= 0 && t < FIREWORKS_MS && this.#knownState?.status === 'yes' ? t : undefined;
+	}
+
+	/** The flip to YES: fireworks for every terminal (and the bell, once). */
+	#celebrate(state: SiteState, at: number): void {
+		this.#celebrated = state.statusChangedAt;
+		if (this.#fireworks?.timer) clearTimeout(this.#fireworks.timer);
+		this.#fireworks = { start: at, timer: null };
+		if (this.#terminalCount() > 0) this.#fireworksFrame(true);
+	}
+
+	#fireworksFrame(bell = false): void {
+		const fireworks = this.#fireworks;
+		if (!fireworks) return;
+		fireworks.timer = null;
+		if (this.#fireworksAt(Date.now()) === undefined) {
+			// Over (or un-flipped): settle on the static frame for whatever the answer is now.
+			this.#fireworks = null;
+			if (this.#terminalCount() > 0) this.#drawTerminals();
+			return;
+		}
+		if (this.#terminalCount() === 0) return; // nobody watching; a terminal joining restarts the show
+		this.#drawTerminals(bell);
+		fireworks.timer = setTimeout(() => this.#fireworksFrame(), FIREWORKS_FRAME_MS);
+	}
+
 	// ── Shared ────────────────────────────────────────────────────────────────
 
 	#viewerCount(): number {
-		return this.#socketCount() + this.#streams.size;
+		return this.#socketCount() + this.#streams.size + this.#terminals.size;
 	}
 
 	#fanOut(msg: LiveMessage): void {
 		const json = JSON.stringify(msg);
-		for (const ws of this.ctx.getWebSockets()) this.#send(ws, json);
-		if (this.#streams.size === 0) return;
-		const frame = sseMessage(msg);
-		for (const client of this.#streams) this.#write(client, frame);
+		// Terminal sockets are in getWebSockets() too, but they get frames, not JSON.
+		const terminals = this.#terminalSocketCount() > 0 ? new Set(this.#terminalSocketList()) : null;
+		for (const ws of this.ctx.getWebSockets()) if (!terminals?.has(ws)) this.#send(ws, json);
+		if (this.#streams.size > 0) {
+			const frame = sseMessage(msg);
+			for (const client of this.#streams) this.#write(client, frame);
+		}
+		if (TERMINAL_REDRAW_TYPES.has(msg.type)) this.#terminalsChanged();
 	}
 
 	/** Keep what broadcasts tell us, so hellos stay fresh without extra D1 reads. */
 	#remember(msg: LiveMessage): void {
 		const at = Date.now();
 		switch (msg.type) {
-			case 'state':
+			case 'state': {
+				const previous = this.#knownState?.status ?? null;
 				this.#broadcastState = { state: msg.state, at };
 				this.#knownState = msg.state;
 				this.#stateSeq++;
+				if (isFreshFlip(previous, msg.state, at, this.#celebrated)) this.#celebrate(msg.state, at);
+				break;
+			}
+			case 'update':
+				this.#latest = { title: msg.update.title, createdAt: msg.update.createdAt };
+				this.#latestSeq++;
 				break;
 			case 'reload':
 				this.#reloadNonce = { value: msg.nonce, at };
@@ -818,7 +1170,7 @@ function readAttachment(ws: WebSocket): SocketAttachment {
 	const raw: unknown = ws.deserializeAttachment();
 	const now = Date.now();
 	if (typeof raw !== 'object' || raw === null) return { connectedAt: now, vibes: [], frameWindowStart: now, frames: 0 };
-	const { connectedAt, vibes, frameWindowStart, frames, country } = raw as Partial<Record<keyof SocketAttachment, unknown>>;
+	const { connectedAt, vibes, frameWindowStart, frames, country, terminal } = raw as Partial<Record<keyof SocketAttachment, unknown>>;
 	const code = country === undefined ? 'XX' : normaliseCountry(country);
 	return {
 		connectedAt: typeof connectedAt === 'number' ? connectedAt : now,
@@ -827,6 +1179,7 @@ function readAttachment(ws: WebSocket): SocketAttachment {
 		frameWindowStart: typeof frameWindowStart === 'number' ? frameWindowStart : now,
 		frames: typeof frames === 'number' ? frames : 0,
 		...(code !== 'XX' ? { country: code } : {}),
+		...(terminal === true ? { terminal: true as const } : {}),
 	};
 }
 
@@ -835,6 +1188,20 @@ function socketCountry(request: Request): string | undefined {
 	const cf = (request as Request & { cf?: { country?: unknown } }).cf;
 	const code = normaliseCountry(typeof cf?.country === 'string' ? cf.country : request.headers.get('cf-ipcountry'));
 	return code === 'XX' ? undefined : code;
+}
+
+function terminalsFull(): Response {
+	return new Response(
+		`All ${MAX_TERMINALS} terminal seats are taken. The answer is the same out here: curl iszacka.dad\n`,
+		{ status: 503, headers: { ...TEXT_HEADERS, 'Retry-After': '60' } },
+	);
+}
+
+function tooManyTerminals(): Response {
+	return new Response(`${MAX_TERMINALS_PER_CLIENT} terminals from one network is plenty. Close one; they all say the same thing.\n`, {
+		status: 429,
+		headers: { ...TEXT_HEADERS, 'Retry-After': '60' },
+	});
 }
 
 function tooManySockets(): Response {

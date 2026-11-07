@@ -134,7 +134,7 @@ export function sendableCloseCode(code: number): number {
 
 /** RPC `details()`: everything the waiting room knows, for /stats. */
 export interface WaitingRoomDetails {
-	/** WebSockets + SSE streams. */
+	/** WebSockets + SSE streams (terminals included in both). */
 	viewers: number;
 	sockets: number;
 	streams: number;
@@ -228,4 +228,54 @@ export const CHECKS_BROADCAST_MS = 1_000;
  */
 export function checksDue(now: number, firstAt: number, lastAt: number): boolean {
 	return now - firstAt >= CHECK_FLUSH_MS || now - lastAt >= CHECK_QUIET_MS;
+}
+
+// ── Terminals: curl -N /live and websocat /live (pure). OWNER: terminal agent ──
+
+/** Hibernation tag on every terminal WebSocket (they get ANSI frames, never JSON). */
+export const TERMINAL_TAG = 'terminal';
+/** The clock tick while any terminal is connected. Never more often than this. */
+export const TERMINAL_TICK_MS = 5_000;
+/** How long one terminal may stay connected. */
+export const TERMINAL_MAX_MS = 15 * 60_000;
+/** Terminals at once, across everyone. */
+export const MAX_TERMINALS = 50;
+/** Terminals at once from one client (IP, or IPv6 /64). */
+export const MAX_TERMINALS_PER_CLIENT = 3;
+/** Broadcast bursts (a vibe storm) are coalesced into at most one redraw per this interval. */
+export const TERMINAL_MIN_REDRAW_MS = 250;
+/** Unread frames before a terminal stream counts as stalled. */
+export const MAX_TERMINAL_PENDING = 16;
+/** The fireworks after the flip to YES, and their frame interval. */
+export const FIREWORKS_MS = 10_000;
+export const FIREWORKS_FRAME_MS = 200;
+/** A flip to YES heard after a wake (no previous status to compare) still counts if this fresh. */
+export const FRESH_FLIP_MS = 2 * 60_000;
+
+/** The next clock tick: the next 5-second boundary after `now`, so ticks are evenly spaced. */
+export function nextTerminalTick(now: number, every = TERMINAL_TICK_MS): number {
+	return (Math.floor(now / every) + 1) * every;
+}
+
+/** Whether a terminal connected at `connectedAt` has had its time. */
+export function terminalExpired(connectedAt: number, now: number, maxMs = TERMINAL_MAX_MS): boolean {
+	return now - connectedAt >= maxMs;
+}
+
+/**
+ * Whether a state broadcast is the flip to YES worth fireworks: it says yes, it isn't one
+ * already celebrated (same statusChangedAt), and the status before it wasn't yes. After a wake
+ * the previous status is unknown (null), so then only a fresh change counts.
+ */
+export function isFreshFlip(
+	previous: Status | null,
+	next: { status: Status; statusChangedAt: string },
+	now: number,
+	celebrated: string | null,
+): boolean {
+	if (next.status !== 'yes' || next.statusChangedAt === celebrated) return false;
+	if (previous === 'yes') return false;
+	if (previous !== null) return true;
+	const changed = Date.parse(next.statusChangedAt);
+	return Number.isFinite(changed) && now - changed >= 0 && now - changed <= FRESH_FLIP_MS;
 }

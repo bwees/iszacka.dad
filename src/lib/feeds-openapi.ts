@@ -5,6 +5,7 @@
 import { BADGE_LABEL_MAX, BADGE_STYLES } from './feeds-badge';
 import { UPDATES_DEFAULT_LIMIT, UPDATES_MAX_LIMIT } from './feeds-api';
 import { MCP_SUPPORTED_VERSIONS } from './feeds-mcp';
+import { FORMATS } from './formats';
 import { SITE_NAME } from './site';
 
 type Doc = Record<string, unknown>;
@@ -52,17 +53,92 @@ export function buildOpenApi(siteUrl: string): Doc {
 			{ name: 'Feeds', description: 'Syndication formats for people who still use feed readers (correctly).' },
 			{ name: 'Widgets', description: 'Badges and embeds.' },
 			{ name: 'Machines', description: 'MCP, OpenAPI and the various .txt files robots like.' },
+			{ name: 'Terminal', description: 'For people who live in a terminal: a live dashboard, a .plan file, and the long view.' },
 		],
 		paths: {
 			'/api/status': {
 				get: {
 					tags: ['Status'],
-					summary: 'The answer, as JSON',
+					summary: 'The answer, as JSON (or whatever your Accept header asks for)',
+					description:
+						'JSON by default. Send an `Accept` header for another format (q-values honoured): `application/xml`, `application/yaml`, `application/toml`, `text/csv`, `text/markdown`, `application/sql`, `text/plain` or `text/html`. Browsers (whose Accept lists `application/xhtml+xml`), wildcards and unrecognised types get JSON. Responses carry `Vary: Accept`.',
 					operationId: 'getStatus',
 					responses: {
-						'200': { description: 'The current answer.', headers: { 'Cache-Control': { $ref: '#/components/headers/NoStore' } }, content: json(ref('Status')) },
+						'200': {
+							description: 'The current answer.',
+							headers: { 'Cache-Control': { $ref: '#/components/headers/NoStore' } },
+							content: {
+								...json(ref('Status')),
+								...Object.fromEntries(
+									FORMATS.filter((f) => f.ext !== 'json' && f.accepts[0]).map((f) => [f.accepts[0] as string, { schema: { type: 'string' } }]),
+								),
+							},
+						},
 						'429': RATE_LIMITED,
 					},
+				},
+			},
+			'/api/status.{format}': {
+				get: {
+					tags: ['Status'],
+					summary: 'The answer, in a format of your choosing',
+					description: `One URL per format: ${FORMATS.filter((f) => f.ext !== 'json' && f.ext !== 'txt')
+						.map((f) => `\`${f.ext}\``)
+						.join(', ')}. \`/api/formats\` lists them all with their content types. The encodings (Morse, Braille, binary, hex, NATO, Base64, ROT13) encode the one-line answer.`,
+					operationId: 'getStatusFormat',
+					parameters: [
+						{
+							name: 'format',
+							in: 'path',
+							required: true,
+							schema: { type: 'string', enum: FORMATS.filter((f) => f.ext !== 'json' && f.ext !== 'txt').map((f) => f.ext) },
+						},
+					],
+					responses: {
+						'200': { description: 'The answer, in that format.', content: { 'text/plain': { schema: { type: 'string' }, example: '-. ---\n' } } },
+						'429': RATE_LIMITED,
+					},
+				},
+			},
+			'/api/formats': {
+				get: {
+					tags: ['Status'],
+					summary: 'Every format the answer comes in',
+					operationId: 'listFormats',
+					responses: { '200': { description: 'The catalogue.', content: json(ref('Formats')) }, '429': RATE_LIMITED },
+				},
+			},
+			'/live': {
+				get: {
+					tags: ['Terminal'],
+					summary: 'A live dashboard for your terminal',
+					description:
+						'`curl -N` gets a never-ending `text/plain` stream of whole-screen ANSI frames, redrawn whenever anything changes (and every 5 seconds for the clocks), for up to 15 minutes. A WebSocket upgrade (`websocat wss://iszacka.dad/live`) gets the same frames as text messages. Browsers get a page explaining all this. 50 terminals at once; beyond that, 503 with `Retry-After`.',
+					operationId: 'getLive',
+					responses: {
+						'101': { description: 'Switching to a WebSocket of ANSI frames.' },
+						'200': { description: 'The stream (or, for browsers, a how-to page).', content: { ...text('text/plain'), ...text('text/html') } },
+						'429': { description: 'Too many terminals from one network, or too many reconnects.', content: text('text/plain') },
+						'503': { description: 'Every terminal seat is taken.', headers: { 'Retry-After': { $ref: '#/components/headers/RetryAfter' } }, content: text('text/plain') },
+					},
+				},
+			},
+			'/.plan': {
+				get: {
+					tags: ['Terminal'],
+					summary: "Zack's Unix .plan file",
+					description: 'Plan, progress bar (from the due date) and ETA. Once Zack is a dad, the plan is complete and a new one begins: sleep.',
+					operationId: 'getPlan',
+					responses: { '200': { description: 'The plan.', content: text('text/plain') } },
+				},
+			},
+			'/is-zack-a-grandad': {
+				get: {
+					tags: ['Terminal'],
+					summary: 'Is Zack a grandad?',
+					description: 'Not yet. An estimate one generation (30 years) after the YES moment, or the due date until then, give or take 15 years. HTML for browsers, ASCII for curl.',
+					operationId: 'getGrandad',
+					responses: { '200': { description: 'The estimate.', content: { ...text('text/html'), ...text('text/plain') } } },
 				},
 			},
 			'/api/status.json': {
@@ -309,6 +385,28 @@ export function buildOpenApi(siteUrl: string): Doc {
 						daysUntilDue: 14,
 						checks: 4096,
 						links: { self: `${siteUrl}/api/status`, html: `${siteUrl}/` },
+					},
+				},
+				Formats: {
+					type: 'object',
+					required: ['formats', 'negotiation'],
+					properties: {
+						formats: {
+							type: 'array',
+							items: {
+								type: 'object',
+								required: ['ext', 'name', 'contentType', 'url', 'accept', 'description'],
+								properties: {
+									ext: { type: 'string' },
+									name: { type: 'string' },
+									contentType: { type: 'string' },
+									url: { type: 'string', format: 'uri' },
+									accept: { type: ['string', 'null'], description: 'The Accept type that selects it on /api/status, if any.' },
+									description: { type: 'string' },
+								},
+							},
+						},
+						negotiation: { type: 'string' },
 					},
 				},
 				History: {

@@ -31,6 +31,8 @@ export const PUBLIC_PAGES: ReadonlyArray<{ path: string; changefreq: 'always' | 
 	{ path: '/privacy', changefreq: 'weekly', priority: 0.3 }, // corporate
 	{ path: '/terms', changefreq: 'weekly', priority: 0.3 }, // corporate
 	{ path: '/achievements', changefreq: 'weekly', priority: 0.3 }, // delights
+	{ path: '/live', changefreq: 'weekly', priority: 0.4 }, // terminal
+	{ path: '/is-zack-a-grandad', changefreq: 'daily', priority: 0.3 }, // terminal
 ];
 
 function dueSummary(state: SiteState, today: string): string {

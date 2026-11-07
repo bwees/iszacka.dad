@@ -9,6 +9,7 @@ import { BADGE_LABEL_MAX } from './feeds-badge';
 import type { DadVerdict, PublicUpdate, StatusDocument } from './feeds-api';
 import { UPDATES_DEFAULT_LIMIT, UPDATES_MAX_LIMIT, statusText } from './feeds-api';
 import { MCP_SUPPORTED_VERSIONS } from './feeds-mcp';
+import { FORMATS } from './formats';
 import { DOMAIN } from './site';
 
 type Html = HtmlEscapedString | Promise<HtmlEscapedString>;
@@ -138,6 +139,7 @@ ${section(
 	'No keys, no sign-up, no SDK. If you can make an HTTP request, you can know whether Zack is a dad.',
 	html`${example('The shortest possible answer', `$ curl ${u}/api/status.txt\n${statusText(s.status)}`)}
 ${example('The answer, in enormous coloured letters', `curl ${host}`)}
+${example('Watch it happen live, as a dashboard in your terminal', `curl -N ${host}/live`)}
 ${example('Watch it happen live (Server-Sent Events)', `curl -N ${u}/api/stream`)}
 ${input.dnsName === null ? '' : example('Over DNS, because why not', `dig TXT ${input.dnsName ?? `answer.${DOMAIN}`} +short`)}`,
 )}
@@ -150,8 +152,12 @@ ${section(
 		{ method: 'GET', path: '/api/status', what: 'The answer as JSON, with the due date, days to go, the check counter and links to everything else.' },
 		{ method: 'GET', path: '/api/status.json', what: 'Identical to /api/status, for people who like file extensions.' },
 		{ method: 'GET', path: '/api/status.txt', what: 'One line of plain text: no, not yet or yes.' },
+		{ method: 'GET', path: '/api/status.{format}', what: `The answer in ${FORMATS.length - 2} more formats: ${FORMATS.filter((f) => f.ext !== 'json' && f.ext !== 'txt').map((f) => f.ext).join(', ')}.` },
+		{ method: 'GET', path: '/api/formats', what: 'Every format, with its URL and content type, as JSON.' },
 		{ method: 'GET', path: '/api/stream', what: 'Server-Sent Events: a hello on connect, then state changes, new updates and live numbers as they happen.' },
 	])}
+${example('The same answer, other formats', `curl ${u}/api/status.morse\n${'-. ---'}\n\ncurl -H 'Accept: application/yaml' ${u}/api/status`)}
+<p class="muted"><code>/api/status</code> negotiates: send <code>Accept: application/xml</code>, <code>application/yaml</code>, <code>application/toml</code>, <code>text/csv</code>, <code>text/markdown</code>, <code>application/sql</code>, <code>text/plain</code> or <code>text/html</code> (q-values honoured). Browsers, wildcards and anything unrecognised still get JSON.</p>
 ${example('GET /api/status (live, as of this page load)', pretty(s))}
 <p class="muted">Fields: <code>status</code> is <code>no</code>, <code>soon</code> (labour has started) or <code>yes</code>. <code>daysUntilDue</code> counts whole days in Europe/London and goes negative when overdue; it is <code>null</code> without a due date. <code>checks</code> is how many times anyone has asked.</p>`,
 )}
@@ -256,6 +262,9 @@ ${section(
 		{ method: 'GET', path: '/api/live', what: 'Live numbers, the current state and the reload nonce, as JSON. For clients that poll instead of holding a WebSocket.' },
 		{ method: 'GET', path: '/stats', what: 'Anxiety analytics: who checks, when, and from where (aggregated).' },
 		{ method: 'GET', path: '/api/countries', what: 'All-time checks per country (country only), for the live map. Cached for a minute; CORS open.' },
+		{ method: 'GET', path: '/live', what: 'A live dashboard for your terminal: curl -N, or a WebSocket for websocat. Browsers get instructions.' },
+		{ method: 'GET', path: '/.plan', what: "Zack's Unix .plan file, progress bar included." },
+		{ method: 'GET', path: '/is-zack-a-grandad', what: 'Not yet. The long-range forecast, with generous error bars (curl gets ASCII).' },
 		{ method: 'GET', path: '/api/ledger', what: 'The Dad Ledger: a hash-chained, Ed25519-signed log of status changes.' },
 		{ method: 'GET', path: '/.well-known/dad-ledger.json', what: 'The ledger and its public key, for independent verification.' },
 		{ method: 'GET', path: '/og.png', what: 'The social preview image for the current status (pre-rendered).' },
@@ -276,7 +285,7 @@ ${section(
 <li><strong>Rate limits:</strong> 120 requests a minute per IP across the API. Go over and you get <code>429</code>, a JSON body and a <code>Retry-After</code>. Polling once a minute is plenty; the baby will not arrive faster if you refresh harder.</li>
 <li><strong>Caching:</strong> status endpoints are <code>no-store</code>; history and updates cache for 30 seconds; feeds and the badge for 60 seconds with ETags.</li>
 <li><strong>Polling:</strong> add <code>?poll=1</code> to <code>/api/status</code> when a timer, not a person, is asking. You get the same answer, and the public "times checked" counter isn't inflated by your dashboard.</li>
-<li><strong>Headers:</strong> every response carries <code>X-Is-Zack-A-Dad</code> and, when there's a due date, <code>X-Days-Until-Due</code>. <code>Server-Timing</code> includes the estimated gestation so far, in milliseconds, because it can.</li>
+<li><strong>Headers:</strong> every response carries <code>X-Is-Zack-A-Dad</code>, <code>X-Nappies-Changed</code> and <code>X-Sleep-Remaining</code> and, when there's a due date, <code>X-Days-Until-Due</code>. <code>Server-Timing</code> includes the estimated gestation so far, in milliseconds, because it can.</li>
 <li><strong>Privacy:</strong> the site knows the status, when it changed and the due date. That is all it will ever know, so please don't ask the API for names or weights.</li>
 </ul>`,
 )}

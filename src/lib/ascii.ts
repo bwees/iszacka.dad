@@ -1,4 +1,4 @@
-// OWNER: feeds agent.
+// OWNER: feeds agent (the live dashboard, /.plan and the grandad estimate: terminal agent).
 // `curl iszacka.dad` → the answer in enormous, hand-assembled block letters, in colour,
 // with a tidy box of supporting facts underneath. HTML is for browsers.
 
@@ -91,21 +91,22 @@ export function bigText(word: string): string[] {
 
 // ─── Colour ──────────────────────────────────────────────────────────────────
 
-const ESC = '\u001b[';
-const RESET = `${ESC}0m`;
-const BOLD = `${ESC}1m`;
-const DIM = `${ESC}2m`;
+export const ESC = '\u001b[';
+export const RESET = `${ESC}0m`;
+export const BOLD = `${ESC}1m`;
+export const DIM = `${ESC}2m`;
 
 /** A top-to-bottom 256-colour gradient per status: red, amber, green. */
-const GRADIENTS: Record<Status, readonly number[]> = {
+export const GRADIENTS: Record<Status, readonly number[]> = {
 	no: [203, 203, 197, 161, 160, 124],
 	soon: [228, 221, 220, 214, 208, 172],
 	yes: [156, 120, 84, 47, 41, 35],
 };
 
-const ACCENT: Record<Status, number> = { no: 203, soon: 214, yes: 84 };
+export const ACCENT: Record<Status, number> = { no: 203, soon: 214, yes: 84 };
 
-const fg = (n: number) => `${ESC}38;5;${n}m`;
+/** 256-colour foreground. */
+export const fg = (n: number) => `${ESC}38;5;${n}m`;
 
 /** Strip ANSI escape sequences (for measuring and for tests). */
 export function stripAnsi(text: string): string {
@@ -162,18 +163,39 @@ export interface AsciiExtra {
 	color?: boolean;
 }
 
+/** Colour helpers for one poster, honouring AsciiExtra.color. */
+export function asciiPaint(status: Status, colour: boolean) {
+	const paint = (code: string) => (s: string) => (colour ? `${code}${s}${RESET}` : s);
+	return { accent: paint(fg(ACCENT[status])), bold: paint(BOLD), dim: paint(DIM) };
+}
+
+/**
+ * The curl poster: a dim kicker, a word in giant gradient letters (coloured for `status`),
+ * and a box of facts. Facts may carry ANSI codes (from asciiPaint).
+ */
+export function asciiPoster(opts: { kicker: string; word: string; status: Status; facts: string[]; color?: boolean }): string {
+	const colour = opts.color ?? true;
+	const { accent, dim } = asciiPaint(opts.status, colour);
+	const gradient = GRADIENTS[opts.status];
+	const letters = bigText(opts.word).map((row, i) => (colour ? `${BOLD}${fg(gradient[i] ?? ACCENT[opts.status])}${row}${RESET}` : row));
+	return [
+		'',
+		dim(`  ${opts.kicker}`),
+		'',
+		...letters.map((row) => `  ${row}`),
+		'',
+		...box(opts.facts, accent).map((row) => `  ${row}`),
+		'',
+		'',
+	].join('\n');
+}
+
 export function renderAscii(state: SiteState, extra: AsciiExtra = {}): string {
 	const colour = extra.color ?? true;
 	const status = state.status;
 	const copy = STATUS_COPY[status];
 	const today = londonDate(extra.now ?? new Date());
-	const paint = (code: string) => (s: string) => (colour ? `${code}${s}${RESET}` : s);
-	const accent = paint(fg(ACCENT[status]));
-	const bold = paint(BOLD);
-	const dim = paint(DIM);
-
-	const gradient = GRADIENTS[status];
-	const letters = bigText(copy.word).map((row, i) => (colour ? `${BOLD}${fg(gradient[i] ?? ACCENT[status])}${row}${RESET}` : row));
+	const { bold, dim } = asciiPaint(status, colour);
 
 	const checks = extra.checks ?? 0;
 	const facts = [
@@ -182,20 +204,12 @@ export function renderAscii(state: SiteState, extra: AsciiExtra = {}): string {
 		dueLine(state, today),
 		`Asked ${plural(checks, 'time')} so far.${status === 'no' && checks > 0 ? ' Still no.' : ''}`,
 		'',
-		`${dim('Live:   ')}curl -N ${DOMAIN}/api/stream`,
+		`${dim('Live:   ')}curl -N ${DOMAIN}/live`,
+		`${dim('SSE:    ')}curl -N ${DOMAIN}/api/stream`,
 		...(extra.dnsName ? [`${dim('DNS:    ')}dig TXT ${extra.dnsName} +short`] : []),
 		`${dim('Short:  ')}curl ${DOMAIN}/api/status.txt`,
 		`${dim('Docs:   ')}https://${DOMAIN}/api`,
 	];
 
-	return [
-		'',
-		dim('  Is Zack a dad?'),
-		'',
-		...letters.map((row) => `  ${row}`),
-		'',
-		...box(facts, accent).map((row) => `  ${row}`),
-		'',
-		'',
-	].join('\n');
+	return asciiPoster({ kicker: 'Is Zack a dad?', word: copy.word, status, facts, color: colour });
 }

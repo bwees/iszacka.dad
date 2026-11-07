@@ -6,6 +6,7 @@ import { LinearRouter } from 'hono/router/linear-router';
 import { handleScheduled } from './cron';
 import { isTerminalClient, renderAscii } from './lib/ascii';
 import { getCheckTotal, recordCheck } from './lib/counters';
+import { STATUS_FORMAT_PATHS } from './lib/formats';
 import { STATUS_COPY, dnsAnswerName } from './lib/site';
 import { getState } from './lib/state';
 import { daysBetween, londonDate } from './lib/time';
@@ -36,8 +37,8 @@ export { InboundWorkflow } from './workflows/inbound';
 // isolate on Workers Free, where the whole invocation gets 10 ms of CPU).
 const app = new Hono<AppEnv>({ router: new LinearRouter() });
 
-/** Paths that count as "checking whether Zack is a dad". */
-const COUNTED_PATHS = new Set(['/', '/api/status', '/api/status.txt', '/api/status.json', '/api/dad']);
+/** Paths that count as "checking whether Zack is a dad" (every /api/status format included). */
+const COUNTED_PATHS = new Set(['/', '/api/status', '/api/status.txt', '/api/status.json', '/api/dad', ...STATUS_FORMAT_PATHS]);
 
 /**
  * Routes that use neither the answer nor the headers that carry it, so they skip the state
@@ -56,7 +57,7 @@ const STATELESS_PATHS = new Set([
 
 /** Whether a request skips the state read: a stateless route, or a WebSocket upgrade (nobody sees a 101's headers). */
 function skipsState(pathname: string, upgrade: string | undefined): boolean {
-	return STATELESS_PATHS.has(pathname) || (pathname === '/ws' && upgrade?.toLowerCase() === 'websocket');
+	return STATELESS_PATHS.has(pathname) || ((pathname === '/ws' || pathname === '/live') && upgrade?.toLowerCase() === 'websocket');
 }
 
 app.use('*', async (c, next) => {
@@ -117,6 +118,11 @@ function applyHeaders(headers: Headers, state: SiteState | undefined, start: num
 		if (!headers.has(name)) headers.set(name, value);
 	};
 	if (state) headers.set('X-Is-Zack-A-Dad', STATUS_COPY[state.status].header);
+	if (state) {
+		const dad = state.status === 'yes';
+		setDefault('X-Nappies-Changed', dad ? 'uncountable' : '0');
+		setDefault('X-Sleep-Remaining', dad ? '0' : 'plenty (for now)');
+	}
 	setDefault('X-Powered-By', 'Hope, caffeine and Cloudflare Workers');
 	if (state?.dueDate) headers.set('X-Days-Until-Due', String(daysBetween(londonDate(), state.dueDate)));
 

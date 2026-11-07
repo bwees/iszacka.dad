@@ -1,6 +1,8 @@
-// OWNER: feeds agent.
+// OWNER: feeds agent (the status formats: terminal agent).
 // /api docs page, /api/status(.txt|.json), /api/history, /api/updates, /api/dad (425 → 201),
-// /openapi.json, and the MCP server at /mcp (mounted from ./mcp).
+// /openapi.json, and the MCP server at /mcp (mounted from ./mcp). Plus the answer in every
+// other format (/api/status.<ext>, Accept negotiation on /api/status, /api/formats).
+
 //
 // Every endpoint here gets CORS (`*`, with preflight), a per-IP rate limit on RL_API
 // (429 + JSON when exceeded) and explicit caching. The guard is attached path by path
@@ -14,6 +16,7 @@ import { buildStatusDocument, dadVerdict, parseUpdatesQuery, publicUpdate, statu
 import { renderApiDocs } from '../lib/feeds-docs';
 import { RPC, mcpTransportError } from '../lib/feeds-mcp';
 import { buildOpenApi } from '../lib/feeds-openapi';
+import { type FormatId, STATUS_FORMAT_PATHS, formatInfo, formatNeedsChecks, formatsCatalogue, negotiateFormat, renderFormat } from '../lib/formats';
 import { renderPage } from '../lib/layout';
 import { allow, clientKey } from '../lib/security';
 import { dnsAnswerName, siteUrl } from '../lib/site';
@@ -38,7 +41,7 @@ const ALLOW_HEADERS = [
 	'Last-Event-ID',
 ].join(', ');
 
-const EXPOSE_HEADERS = ['ETag', 'Location', 'Retry-After', 'X-Is-Zack-A-Dad', 'X-Days-Until-Due'].join(', ');
+const EXPOSE_HEADERS = ['ETag', 'Location', 'Retry-After', 'X-Is-Zack-A-Dad', 'X-Days-Until-Due', 'X-Nappies-Changed', 'X-Sleep-Remaining'].join(', ');
 
 /** Methods each guarded path answers (OPTIONS is implied). */
 const GUARDED: Record<string, string> = {
@@ -51,6 +54,7 @@ const GUARDED: Record<string, string> = {
 	'/openapi.json': 'GET, HEAD',
 	[MCP_PATH]: 'POST',
 };
+for (const path of [...STATUS_FORMAT_PATHS, '/api/formats']) GUARDED[path] = 'GET, HEAD';
 
 export function applyCors(headers: Headers): void {
 	headers.set('Access-Control-Allow-Origin', '*');
@@ -126,8 +130,31 @@ async function statusDocument(c: Context<AppEnv>) {
 // ─── Status ──────────────────────────────────────────────────────────────────
 
 const status = async (c: Context<AppEnv>) => jsonResponse(await statusDocument(c), { cache: 'no-store' });
-apiRoutes.get('/api/status', status);
+// Accept negotiation: JSON unless asked otherwise (browsers and wildcards still get JSON).
+apiRoutes.get('/api/status', async (c) => {
+	const format = negotiateFormat(c.req.header('accept'));
+	const res = format === 'json' ? await status(c) : await formatResponse(c, format);
+	res.headers.set('Vary', 'Accept');
+	return res;
+});
 apiRoutes.get('/api/status.json', status);
+
+/** The answer in one of the formats in lib/formats.ts. Only the structured ones ask for the check total. */
+async function formatResponse(c: Context<AppEnv>, ext: FormatId): Promise<Response> {
+	const base = siteUrl(c.env);
+	const checks = formatNeedsChecks(ext) ? await getCheckTotal(c.env).catch(() => 0) : 0;
+	const doc = buildStatusDocument(c.get('state'), { checks, today: londonDate(), siteUrl: base });
+	return new Response(renderFormat(ext, doc, `${base}/api/status.${ext}`), {
+		headers: { 'Content-Type': formatInfo(ext)?.contentType ?? 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' },
+	});
+}
+
+for (const path of STATUS_FORMAT_PATHS) {
+	const ext = path.slice('/api/status.'.length) as FormatId;
+	apiRoutes.get(path, (c) => formatResponse(c, ext));
+}
+
+apiRoutes.get('/api/formats', (c) => jsonResponse(formatsCatalogue(siteUrl(c.env)), { cache: 'public, max-age=3600' }));
 
 apiRoutes.get('/api/status.txt', (c) => {
 	return new Response(`${statusText(c.get('state').status)}\n`, {
