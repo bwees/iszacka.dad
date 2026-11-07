@@ -19,6 +19,7 @@
 //   anything else     200, ignored
 
 import { Hono } from 'hono';
+import { LinearRouter } from 'hono/router/linear-router';
 import { bareAddress } from '../email-handler';
 import { sha256Hex, timingSafeEqual } from '../lib/security';
 import { nowIso } from '../lib/time';
@@ -26,7 +27,7 @@ import { disableSubscriberByEmail } from '../notify/email';
 import type { AppEnv } from '../types';
 import type { InboundParams } from '../workflows/inbound';
 
-export const resendWebhookRoutes = new Hono<AppEnv>();
+export const resendWebhookRoutes = new Hono<AppEnv>({ router: new LinearRouter() });
 
 /** Reject deliveries older than this (replay protection). */
 export const MAX_SKEW_SECONDS = 300;

@@ -7,6 +7,7 @@
 
 import { Hono, type Context } from 'hono';
 import { html } from 'hono/html';
+import { LinearRouter } from 'hono/router/linear-router';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import {
 	CONFIRM_WORDS,
@@ -57,7 +58,7 @@ import { updateAnswerRecord } from '../notify/dns';
 import { emailDailyLimit, emailSendsToday, sendTestEmail } from '../notify/email';
 import { STATUSES, isStatus, type AppEnv, type SiteState, type Status, type Update } from '../types';
 
-export const adminRoutes = new Hono<AppEnv>();
+export const adminRoutes = new Hono<AppEnv>({ router: new LinearRouter() });
 
 type Ctx = Context<AppEnv>;
 

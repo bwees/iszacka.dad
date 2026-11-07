@@ -5,13 +5,14 @@
 import type { Context } from 'hono';
 import { Hono } from 'hono';
 import { html } from 'hono/html';
+import { LinearRouter } from 'hono/router/linear-router';
 import { allow, base64UrlDecode, clientIp, clientKey, turnstileEnabled, verifyTurnstile } from '../lib/security';
 import { getVapidPublicKey, isUncompressedP256Point } from '../lib/vapid';
 import { deliverPush, isPushServiceHost } from '../notify/push';
 import { checkPublicHttpsUrl, ownHosts, systemUpdate } from '../notify/webhooks';
 import type { AppEnv, PushSubscriptionRow } from '../types';
 
-export const pushRoutes = new Hono<AppEnv>();
+export const pushRoutes = new Hono<AppEnv>({ router: new LinearRouter() });
 
 export const MAX_PUSH_ENDPOINT_LENGTH = 2048;
 /**

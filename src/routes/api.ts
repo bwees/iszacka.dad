@@ -11,6 +11,7 @@
 
 import type { Context, MiddlewareHandler } from 'hono';
 import { Hono } from 'hono';
+import { LinearRouter } from 'hono/router/linear-router';
 import { getCheckTotal } from '../lib/counters';
 import { buildStatusDocument, dadVerdict, parseUpdatesQuery, publicUpdate, statusText } from '../lib/feeds-api';
 import { renderApiDocs } from '../lib/feeds-docs';
@@ -26,7 +27,7 @@ import { listUpdates } from '../lib/updates';
 import type { AppEnv } from '../types';
 import { MCP_PATH, mcpRoutes } from './mcp';
 
-export const apiRoutes = new Hono<AppEnv>();
+export const apiRoutes = new Hono<AppEnv>({ router: new LinearRouter() });
 
 // ─── CORS + rate limiting ────────────────────────────────────────────────────
 

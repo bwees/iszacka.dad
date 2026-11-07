@@ -14,6 +14,7 @@
 import type { Context } from 'hono';
 import { Hono } from 'hono';
 import { html } from 'hono/html';
+import { LinearRouter } from 'hono/router/linear-router';
 import { boilerplate, pressBody, privacyBody, termsBody } from '../lib/corporate';
 import { renderPage, type Html } from '../lib/layout';
 import { emailDailyLimit } from '../notify/email';
@@ -37,7 +38,7 @@ import type { AppEnv } from '../types';
 
 type Ctx = Context<AppEnv>;
 
-export const corporateRoutes = new Hono<AppEnv>();
+export const corporateRoutes = new Hono<AppEnv>({ router: new LinearRouter() });
 
 const CORP_CSS = html`<link rel="stylesheet" href="/corporate.css">`;
 

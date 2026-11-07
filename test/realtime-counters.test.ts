@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { fillDays, fillHours, isBot, isPrefetch, normaliseColo, normaliseCountry } from '../src/lib/counters';
-import { COLO_CITIES, coloInfo, countryName, flagEmoji } from '../src/lib/counters-geo';
+import { coloCities, coloInfo, countryName, flagEmoji } from '../src/lib/counters-geo';
 
 const HUMANS = {
 	'Chrome on Windows':
@@ -137,7 +137,7 @@ describe('coloInfo', () => {
 		}
 	});
 	it('has a healthy number of well-formed entries', () => {
-		const entries = Object.entries(COLO_CITIES);
+		const entries = Object.entries(coloCities());
 		expect(entries.length).toBeGreaterThanOrEqual(60);
 		for (const [code, [city, country]] of entries) {
 			expect(code).toMatch(/^[A-Z]{3}$/);

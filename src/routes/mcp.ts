@@ -4,6 +4,7 @@
 // the request's state and data sources into it.
 
 import { Hono } from 'hono';
+import { LinearRouter } from 'hono/router/linear-router';
 import { getCheckTotal } from '../lib/counters';
 import { type McpDeps, handleMcpHttp } from '../lib/feeds-mcp';
 import { dadForecast } from '../lib/forecast';
@@ -15,7 +16,7 @@ import type { AppEnv } from '../types';
 
 export const MCP_PATH = '/mcp';
 
-export const mcpRoutes = new Hono<AppEnv>();
+export const mcpRoutes = new Hono<AppEnv>({ router: new LinearRouter() });
 
 mcpRoutes.all(MCP_PATH, (c) => {
 	const env = c.env;

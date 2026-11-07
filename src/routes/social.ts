@@ -5,6 +5,7 @@
 
 import { Hono } from 'hono';
 import { html, raw } from 'hono/html';
+import { LinearRouter } from 'hono/router/linear-router';
 import { countryName } from '../lib/counters-geo';
 import { DADCON_LEVELS, type DadconInfo, dadcon } from '../lib/dadcon';
 import { type Html, fragmentCache } from '../lib/layout';
@@ -13,7 +14,7 @@ import { ANXIETY_LEVELS, gaugeAngle } from '../lib/social';
 import { formatNumber, londonDate } from '../lib/time';
 import type { AnxietyLevel, AnxietyReading, AppEnv, SiteState } from '../types';
 
-export const socialRoutes = new Hono<AppEnv>();
+export const socialRoutes = new Hono<AppEnv>({ router: new LinearRouter() });
 
 // ─── GET /api/countries ──────────────────────────────────────────────────────
 

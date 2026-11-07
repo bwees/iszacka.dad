@@ -6,6 +6,7 @@
 import type { Context } from 'hono';
 import { Hono } from 'hono';
 import { html } from 'hono/html';
+import { LinearRouter } from 'hono/router/linear-router';
 import { renderPage } from '../lib/layout';
 import {
 	CANONICAL_FORMAT,
@@ -28,7 +29,7 @@ import { DAD, STATUS_COPY } from '../lib/site';
 import { formatLondon } from '../lib/time';
 import type { AppEnv, Status } from '../types';
 
-export const ledgerRoutes = new Hono<AppEnv>();
+export const ledgerRoutes = new Hono<AppEnv>({ router: new LinearRouter() });
 
 type Ctx = Context<AppEnv>;
 

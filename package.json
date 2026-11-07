@@ -16,11 +16,11 @@
     "deploy": "wrangler deploy"
   },
   "dependencies": {
-    "hono": "^4.13.16",
-    "qrcode-generator": "^2.0.4"
+    "hono": "^4.13.16"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
+    "qrcode-generator": "^2.0.4",
     "typescript": "^7.0.2",
     "vitest": "^5.1.0",
     "wrangler": "^4.158.0"

@@ -2,13 +2,14 @@
 //
 // CONTRACT (must stay stable; other modules call it):
 //   renderPage(c, opts) → Promise<Response>
+//   renderPageHtml(c, opts) → Promise<string> (the same markup, for pages that cache it)
 // The shell provides <head> (meta, OG tags, favicon, manifest, styles), the site
 // header/nav, <main> with `opts.body`, the footer, and loads /app.js on every page.
 // Pages pass data to client JS via data-* attributes; inline <script> is blocked by CSP.
 
 import type { Context } from 'hono';
 import { html, raw } from 'hono/html';
-import type { HtmlEscapedString } from 'hono/utils/html';
+import { HtmlEscapedCallbackPhase, resolveCallback, type HtmlEscapedString } from 'hono/utils/html';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import type { AppEnv, SiteState, Status } from '../types';
 import { STATUSES } from '../types';
@@ -203,6 +204,18 @@ function safeSameOriginScript(src: string): boolean {
 }
 
 export async function renderPage(c: Context<AppEnv>, opts: PageOptions): Promise<Response> {
+	return c.html(pageMarkup(c, opts), (opts.status ?? 200) as ContentfulStatusCode);
+}
+
+/**
+ * The markup renderPage sends, as a string, for a page that keeps a copy (the home page's edge
+ * cache). The caller makes the Response (and picks its status).
+ */
+export async function renderPageHtml(c: Context<AppEnv>, opts: PageOptions): Promise<string> {
+	return String(await resolveCallback(await pageMarkup(c, opts), HtmlEscapedCallbackPhase.Stringify, false, {}));
+}
+
+function pageMarkup(c: Context<AppEnv>, opts: PageOptions): Html {
 	const state = pageState(c);
 	const copy = STATUS_COPY[state.status];
 	const requestPath = (() => {
@@ -234,7 +247,7 @@ export async function renderPage(c: Context<AppEnv>, opts: PageOptions): Promise
 		? ''
 		: footerCache(`${state.status}|${build ? `${build.tag ?? build.id}|${build.timestamp ?? ''}` : 'local'}`, () => siteFooter(state.status, build));
 
-	const page = html`<!doctype html>
+	return html`<!doctype html>
 <html lang="en-GB" data-status="${state.status}" data-page="${isHome ? 'home' : 'page'}" data-title-base="${fullTitle}" data-changed-at="${state.statusChangedAt}" data-due-date="${state.dueDate ?? ''}">
 <head>
 <meta charset="utf-8">
@@ -286,7 +299,6 @@ ${header}
 ${footer}
 </body>
 </html>`;
-	return c.html(page, (opts.status ?? 200) as ContentfulStatusCode);
 }
 
 const headerCache = fragmentCache();

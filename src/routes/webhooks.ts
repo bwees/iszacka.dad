@@ -5,6 +5,7 @@
 import type { Context } from 'hono';
 import { Hono } from 'hono';
 import { html } from 'hono/html';
+import { LinearRouter } from 'hono/router/linear-router';
 import { type Html, renderPage } from '../lib/layout';
 import { allow, clientIp, clientKey, randomToken, turnstileEnabled, turnstileWidget, verifyTurnstile, wantsJson } from '../lib/security';
 import { siteUrl, STATUS_COPY } from '../lib/site';
@@ -30,7 +31,7 @@ import {
 } from '../notify/webhooks';
 import type { AppEnv, Frequency, SiteState, WebhookKind } from '../types';
 
-export const webhookRoutes = new Hono<AppEnv>();
+export const webhookRoutes = new Hono<AppEnv>({ router: new LinearRouter() });
 
 /** Generous for a URL, two selects and a Turnstile token. */
 const MAX_FORM_BYTES = 16 * 1024;

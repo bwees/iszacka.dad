@@ -9,6 +9,7 @@
 import type { Context } from 'hono';
 import { Hono } from 'hono';
 import { html } from 'hono/html';
+import { LinearRouter } from 'hono/router/linear-router';
 import { renderAdminPage, requireAdmin } from '../lib/admin';
 import {
 	CHECKLIST_LABEL_MAX,
@@ -78,7 +79,7 @@ import type { AppEnv, SiteState, Status } from '../types';
 
 type Ctx = Context<AppEnv>;
 
-export const communityRoutes = new Hono<AppEnv>();
+export const communityRoutes = new Hono<AppEnv>({ router: new LinearRouter() });
 
 for (const path of ['/admin/checklist/*', '/admin/wall/*', '/admin/names/*']) {
 	communityRoutes.use(path, requireAdmin);

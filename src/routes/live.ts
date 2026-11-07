@@ -3,6 +3,7 @@
 
 import { type Context, Hono } from 'hono';
 import { html } from 'hono/html';
+import { LinearRouter } from 'hono/router/linear-router';
 import type { WaitingRoomDetails } from '../do/waiting-room-protocol';
 import { type CheckStats, getCheckStats, getCheckTotal, type Tally } from '../lib/counters';
 import { coloInfo, countryName, flagEmoji } from '../lib/counters-geo';
@@ -13,7 +14,7 @@ import { getStatusHistory } from '../lib/state';
 import { formatDayMonth, formatLondon, formatLondonDate, formatNumber, formatWeekdayDayMonth, londonDate, londonHour } from '../lib/time';
 import type { AppEnv, SiteState, Status } from '../types';
 
-export const liveRoutes = new Hono<AppEnv>();
+export const liveRoutes = new Hono<AppEnv>({ router: new LinearRouter() });
 
 const NO_STORE = { 'Cache-Control': 'no-store' } as const;
 

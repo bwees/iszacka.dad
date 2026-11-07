@@ -37,6 +37,9 @@ name = "iszacka-dad"
 main = "src/index.ts"
 compatibility_date = "2026-10-01"
 compatibility_flags = ["nodejs_compat"]
+# esbuild's keep_names wraps ~1,200 functions in __name(fn, "name") calls that run at module
+# load on every cold isolate (about 0.4 ms of CPU, 44 KB of bundle). Nothing reads Function.name.
+keep_names = false
 
 # Static assets win for any path that exists in ./public; everything else runs the Worker.
 assets = { directory = "./public", binding = "ASSETS" }

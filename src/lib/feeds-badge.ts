@@ -49,8 +49,10 @@ export function sanitiseBadgeLabel(raw: string | undefined): string {
 }
 
 // Advance widths of Verdana at 11px (the shields.io font), measured per ASCII glyph.
-// Close enough that text never overflows; `textLength` irons out the rest.
-const VERDANA_11: Record<string, number> = {
+// Close enough that text never overflows; `textLength` irons out the rest. Built on first use
+// (only badges need it; module scope runs on every cold isolate).
+let verdanaWidths: Record<string, number> | undefined;
+const verdana11 = (): Record<string, number> => (verdanaWidths ??= {
 	' ': 3.87, '!': 4.33, '"': 5.05, '#': 9.0, $: 7.0, '%': 11.84, '&': 7.99, "'": 2.95, '(': 4.99, ')': 4.99,
 	'*': 7.0, '+': 9.0, ',': 4.0, '-': 4.99, '.': 4.0, '/': 4.99, ':': 4.99, ';': 4.99, '<': 9.0, '=': 9.0,
 	'>': 9.0, '?': 5.97, '@': 11.0, '[': 4.99, '\\': 4.99, ']': 4.99, '^': 9.0, _: 7.0, '`': 7.0, '{': 6.98,
@@ -61,7 +63,7 @@ const VERDANA_11: Record<string, number> = {
 	a: 6.61, b: 6.82, c: 5.73, d: 6.82, e: 6.55, f: 3.78, g: 6.82, h: 6.96, i: 3.02, j: 3.78, k: 6.51, l: 3.02,
 	m: 10.69, n: 6.96, o: 6.68, p: 6.82, q: 6.82, r: 4.69, s: 5.73, t: 4.33, u: 6.96, v: 6.51, w: 8.98, x: 6.51,
 	y: 6.51, z: 5.73,
-};
+});
 const DIGIT_WIDTH = 7.0;
 const FALLBACK_WIDTH = 7.0;
 const WIDE_WIDTH = 11.0;
@@ -98,6 +100,7 @@ function isZeroWidth(codePoint: number): boolean {
 export function estimateTextWidth(text: string, opts: { size?: number; bold?: boolean; letterSpacing?: number } = {}): number {
 	const scale = (opts.size ?? 11) / 11;
 	const boldFactor = opts.bold ? 1.1 : 1;
+	const widths = verdana11();
 	let width = 0;
 	let glyphs = 0;
 	for (const ch of text) {
@@ -105,7 +108,7 @@ export function estimateTextWidth(text: string, opts: { size?: number; bold?: bo
 		if (isZeroWidth(cp)) continue;
 		glyphs++;
 		if (ch >= '0' && ch <= '9') width += DIGIT_WIDTH;
-		else width += VERDANA_11[ch] ?? (isWide(cp) ? WIDE_WIDTH : FALLBACK_WIDTH);
+		else width += widths[ch] ?? (isWide(cp) ? WIDE_WIDTH : FALLBACK_WIDTH);
 	}
 	const spacing = (opts.letterSpacing ?? 0) * Math.max(0, glyphs - 1);
 	return width * scale * boldFactor + spacing;

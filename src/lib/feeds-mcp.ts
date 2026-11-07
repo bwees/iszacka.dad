@@ -252,7 +252,10 @@ function dueSummary(state: SiteState, today: string): { summary: string; days: n
 	return { summary: `${prefix}Due ${when}: ${plural(-days, 'day')} overdue.`, days };
 }
 
-export const MCP_TOOLS: readonly ToolDef[] = [
+let toolDefs: readonly ToolDef[] | undefined;
+
+/** The tools, built on first use (only /mcp needs them; module scope runs on every cold isolate). */
+export const mcpTools = (): readonly ToolDef[] => (toolDefs ??= [
 	{
 		name: 'is_zack_a_dad',
 		title: 'Is Zack a dad?',
@@ -446,7 +449,7 @@ export const MCP_TOOLS: readonly ToolDef[] = [
 			};
 		},
 	},
-];
+]);
 
 function inputSchema(tool: ToolDef): JsonSchema {
 	const properties: JsonObject = {};
@@ -498,7 +501,7 @@ function validateToolArgs(tool: ToolDef, raw: JsonObject): { ok: true; values: R
 async function callTool(era: Era, params: JsonObject, deps: McpDeps): Promise<{ result: JsonObject } | { error: RpcError }> {
 	const name = params.name;
 	if (typeof name !== 'string' || !name) return { error: { code: RPC.INVALID_PARAMS, message: 'tools/call needs a tool "name".' } };
-	const tool = MCP_TOOLS.find((t) => t.name === name);
+	const tool = mcpTools().find((t) => t.name === name);
 	if (!tool) return { error: { code: RPC.INVALID_PARAMS, message: `Unknown tool: ${name}` } };
 	const rawArgs = params.arguments ?? {};
 	if (!isObject(rawArgs)) return { error: { code: RPC.INVALID_PARAMS, message: '"arguments" must be an object.' } };
@@ -563,7 +566,7 @@ async function dispatch(era: Era, id: RequestId, method: string, params: JsonObj
 			if (params.cursor !== undefined) {
 				return { status: modern ? 400 : 200, body: fail(id, RPC.INVALID_PARAMS, 'Invalid cursor: the tool list has a single page.') };
 			}
-			const result: JsonObject = { tools: MCP_TOOLS.map((t) => describeTool(t, era)) };
+			const result: JsonObject = { tools: mcpTools().map((t) => describeTool(t, era)) };
 			if (modern) Object.assign(result, { ttlMs: LIST_TTL_MS, cacheScope: 'public' });
 			return done(result);
 		}

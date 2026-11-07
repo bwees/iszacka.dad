@@ -6,10 +6,11 @@
 
 import { Hono } from 'hono';
 import { html } from 'hono/html';
+import { LinearRouter } from 'hono/router/linear-router';
 import { type Html, fragmentCache, renderPage } from '../lib/layout';
 import type { AppEnv } from '../types';
 
-export const delightsRoutes = new Hono<AppEnv>();
+export const delightsRoutes = new Hono<AppEnv>({ router: new LinearRouter() });
 
 export const ACHIEVEMENTS_PATH = '/achievements';
 

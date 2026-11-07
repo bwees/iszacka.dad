@@ -19,12 +19,16 @@ const INVISIBLE = /[\u00AD\u200B\u200E\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2
 const CONTROL = /[\u0000-\u001F\u007F-\u009F]/g;
 /** C0/C1 control characters except the newline. */
 const CONTROL_EXCEPT_NEWLINE = /[\u0000-\u0009\u000B-\u001F\u007F-\u009F]/g;
-/** More than three combining marks in a row is Zalgo, not a name. */
-const ZALGO = /(\p{M}{3})\p{M}+/gu;
+/**
+ * More than three combining marks in a row is Zalgo, not a name. Built on first use: V8 builds a
+ * Unicode-property regex's character tables when it creates the literal, and module scope runs on
+ * every cold isolate, so the `\p{…}` patterns here stay out of it.
+ */
+let zalgo: RegExp | undefined;
 
 function baseClean(raw: unknown): string {
 	if (typeof raw !== 'string') return '';
-	return raw.toWellFormed().normalize('NFC').replace(INVISIBLE, '').replace(ZALGO, '$1');
+	return raw.toWellFormed().normalize('NFC').replace(INVISIBLE, '').replace((zalgo ??= /(\p{M}{3})\p{M}+/gu), '$1');
 }
 
 /** Clean single-line user input: NFC, no control or invisible characters, single spaces, trimmed. */
@@ -513,8 +517,9 @@ export const NAME_MAX = 40;
 export const SUGGESTED_BY_MAX = 40;
 export const NAMES_LIST_LIMIT = 100;
 
-/** Words of letters (with accents), joined by single spaces, hyphens or apostrophes. */
-const NAME_PATTERN = /^\p{L}[\p{L}\p{M}]*(?:[ '-]\p{L}[\p{L}\p{M}]*)*$/u;
+/** Words of letters (with accents), joined by single spaces, hyphens or apostrophes. Built on first use (see baseClean). */
+let nameRegex: RegExp | undefined;
+const namePattern = (): RegExp => (nameRegex ??= /^\p{L}[\p{L}\p{M}]*(?:[ '-]\p{L}[\p{L}\p{M}]*)*$/u);
 
 /** The same rule for the browser's `pattern` attribute (which uses the `v` flag). */
 export const NAME_HTML_PATTERN = "[\\p{L}\\p{M} '\u2018\u2019\\-\u2010\u2011\u2013]+";
@@ -534,7 +539,7 @@ export function nameKey(name: string): string {
 }
 
 export function isValidSuggestedName(name: string): boolean {
-	return charLength(name) <= NAME_MAX && NAME_PATTERN.test(name);
+	return charLength(name) <= NAME_MAX && namePattern().test(name);
 }
 
 export interface NameSuggestionInput {
@@ -555,7 +560,7 @@ export function validateNameSuggestion(input: {
 	const errors: FieldErrors<'name' | 'suggestedBy'> = {};
 	if (!name) errors.name = 'Please suggest a name. Silence has been noted, but cannot be counted.';
 	else if (charLength(name) > NAME_MAX) errors.name = `Names are limited to ${NAME_MAX} characters. The form at the registry office has a small box.`;
-	else if (!NAME_PATTERN.test(name)) {
+	else if (!namePattern().test(name)) {
 		errors.name = 'Letters, spaces, hyphens and apostrophes only. Digits are for passwords, not babies.';
 	}
 	if (charLength(suggestedBy) > SUGGESTED_BY_MAX) errors.suggestedBy = `Your name is limited to ${SUGGESTED_BY_MAX} characters here.`;

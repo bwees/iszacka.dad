@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { MCP_SUPPORTED_VERSIONS, MCP_TOOLS, type McpDeps, RPC, decodeMcpHeaderValue, handleMcpHttp, isAcceptableOrigin } from '../src/lib/feeds-mcp';
+import { MCP_SUPPORTED_VERSIONS, type McpDeps, mcpTools, RPC, decodeMcpHeaderValue, handleMcpHttp, isAcceptableOrigin } from '../src/lib/feeds-mcp';
 import type { SiteState, Update } from '../src/types';
 import { validate } from './feeds-schema-helper';
 
@@ -238,7 +238,7 @@ describe('modern (2026-07-28, per-request metadata)', () => {
 });
 
 describe('tools', () => {
-	const schemaOf = (name: string) => MCP_TOOLS.find((t) => t.name === name)?.outputSchema ?? {};
+	const schemaOf = (name: string) => mcpTools().find((t) => t.name === name)?.outputSchema ?? {};
 
 	it('is_zack_a_dad answers, with structured content matching its schema', async () => {
 		const { json } = await modern('tools/call', { name: 'is_zack_a_dad', arguments: {} });

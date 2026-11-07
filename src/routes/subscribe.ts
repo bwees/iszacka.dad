@@ -9,10 +9,11 @@
 // mail security scanners open every link in an email, so GET /confirm only shows a button, and
 // the confirmation itself is a POST.
 
-import type { Context } from 'hono';
+import type { Context, MiddlewareHandler } from 'hono';
 import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { html } from 'hono/html';
+import { LinearRouter } from 'hono/router/linear-router';
 import { dailyLine } from '../lib/daily';
 import { type Html, renderPage } from '../lib/layout';
 import { allow, clientIp, clientKey, isValidEmail, randomToken, turnstileWidget, verifyTurnstile, wantsJson } from '../lib/security';
@@ -31,7 +32,7 @@ import type { AppEnv, Frequency, Status, SubscriberRow } from '../types';
 
 type Ctx = Context<AppEnv>;
 
-export const subscribeRoutes = new Hono<AppEnv>();
+export const subscribeRoutes = new Hono<AppEnv>({ router: new LinearRouter() });
 
 /** One confirmation (or "already subscribed") email per address per this window. */
 export const CONFIRM_RESEND_MS = 10 * 60 * 1000;
@@ -41,10 +42,13 @@ const FREQUENCIES: readonly Frequency[] = ['big', 'daily'];
 
 export const CHECK_INBOX_MESSAGE = `Check your inbox. If that address can receive email, a message from the stork is on its way: click the link inside within ${UNCONFIRMED_TTL_DAYS} days to confirm.`;
 
-const limitBody = bodyLimit({
-	maxSize: 16 * 1024,
-	onError: (c) => c.text('That is a lot of form. Please send less of it.', 413),
-});
+// Built on first use: only form posts need it, and module scope runs on every cold isolate.
+let bodyLimiter: MiddlewareHandler | undefined;
+const limitBody: MiddlewareHandler = (c, next) =>
+	(bodyLimiter ??= bodyLimit({
+		maxSize: 16 * 1024,
+		onError: (c) => c.text('That is a lot of form. Please send less of it.', 413),
+	}))(c, next);
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 

@@ -5,6 +5,7 @@
 import type { Context } from 'hono';
 import { Hono } from 'hono';
 import { html, raw } from 'hono/html';
+import { LinearRouter } from 'hono/router/linear-router';
 import { getCheckTotal } from '../lib/counters';
 import {
 	FEED_CACHE_CONTROL,
@@ -33,7 +34,7 @@ import { daysBetween, formatLondonDate, londonDate } from '../lib/time';
 import { listUpdates } from '../lib/updates';
 import type { AppEnv, SiteState, Update } from '../types';
 
-export const feedRoutes = new Hono<AppEnv>();
+export const feedRoutes = new Hono<AppEnv>({ router: new LinearRouter() });
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 

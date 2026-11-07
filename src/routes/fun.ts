@@ -3,7 +3,7 @@
 
 import { Hono, type Context } from 'hono';
 import { html, raw } from 'hono/html';
-import qrcode from 'qrcode-generator';
+import { LinearRouter } from 'hono/router/linear-router';
 import { renderAdminPage, requireAdmin } from '../lib/admin';
 import {
 	HEALTH_LABEL,
@@ -44,13 +44,14 @@ import {
 	type GuessRecord,
 	type Leaderboard,
 } from '../lib/pool';
+import { POSTER_QR_SVG } from '../lib/poster-qr';
 import { allow, clientIp, clientKey, hashIdentifier, sha256Hex, turnstileWidget, verifyTurnstile, wantsJson } from '../lib/security';
 import { DAD, DOMAIN } from '../lib/site';
 import { getStatusHistory } from '../lib/state';
 import { formatLondon, formatLondonDate, formatNumber, formatWeekdayDayMonth, londonDate, nowIso } from '../lib/time';
 import type { AppEnv, SiteState, Status } from '../types';
 
-export const funRoutes = new Hono<AppEnv>();
+export const funRoutes = new Hono<AppEnv>({ router: new LinearRouter() });
 
 type Ctx = Context<AppEnv>;
 
@@ -751,7 +752,6 @@ funRoutes.get('/certificate', async (c) => {
 
 // ─── /poster ─────────────────────────────────────────────────────────────────
 
-const POSTER_URL = `https://${DOMAIN}`;
 const TEAR_OFF_STRIPS = 10;
 
 const POSTER_CSS = `
@@ -791,35 +791,8 @@ const POSTER_CSS = `
 }
 `;
 
-/** The QR code for `text` as an inline SVG: one path, horizontal runs merged, 4-module quiet zone. */
-function qrSvg(text: string, label: string): string {
-	const qr = qrcode(0, 'M');
-	qr.addData(text);
-	qr.make();
-	const n = qr.getModuleCount();
-	const quiet = 4;
-	let d = '';
-	for (let row = 0; row < n; row++) {
-		let col = 0;
-		while (col < n) {
-			if (!qr.isDark(row, col)) {
-				col++;
-				continue;
-			}
-			const start = col;
-			while (col < n && qr.isDark(row, col)) col++;
-			d += `M${start + quiet} ${row + quiet}h${col - start}v1h-${col - start}z`;
-		}
-	}
-	const size = n + quiet * 2;
-	return String(
-		html`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size} ${size}" shape-rendering="crispEdges" role="img" aria-label="${label}"><title>${label}</title><rect width="${size}" height="${size}" fill="#fff"/><path fill="#111" d="${d}"/></svg>`,
-	);
-}
-
-/** The poster's QR code never changes, and making one tries eight masks, so it's made once per isolate. */
-let posterQr: string | undefined;
-
+// The QR code (POSTER_QR_SVG) is made at build time by scripts/poster-qr.ts: it never changes,
+// and encoding it tries eight masks, about 3 ms of CPU on every cold isolate.
 funRoutes.get('/poster', (c) => {
 	const strips = Array.from(
 		{ length: TEAR_OFF_STRIPS },
@@ -830,7 +803,7 @@ funRoutes.get('/poster', (c) => {
 	<article class="fun-poster" aria-label="Fridge poster">
 		<p class="fun-poster-flag">Public information notice</p>
 		<h1 class="fun-poster-title">Is Zack a dad?</h1>
-		<div class="fun-poster-qr">${raw((posterQr ??= qrSvg(POSTER_URL, `QR code linking to ${POSTER_URL}`)))}</div>
+		<div class="fun-poster-qr">${raw(POSTER_QR_SVG)}</div>
 		<p class="fun-poster-cta">Scan to find out</p>
 		<p class="fun-poster-sub">Or visit ${DOMAIN}. Answers 24 hours a day. Updated the moment it happens. No app required. Fridge-safe.</p>
 		<p class="fun-poster-reward">Reward: the smug feeling of knowing first</p>

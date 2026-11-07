@@ -5,14 +5,15 @@ import type { Context, ErrorHandler, NotFoundHandler } from 'hono';
 import { Hono } from 'hono';
 import { html, raw } from 'hono/html';
 import { HTTPException } from 'hono/http-exception';
+import { LinearRouter } from 'hono/router/linear-router';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
-import { getReadinessSummary, type ReadinessSummary } from '../lib/community';
+import { getReadinessSummary, readinessPercent, type ReadinessSummary } from '../lib/community';
 import { getCheckTotal } from '../lib/counters';
 import { regionName } from '../lib/counters-geo';
 import { dadForecast, type ForecastDay } from '../lib/forecast';
 import { babySize, type BabySize } from '../lib/fruit';
 import { TRANSLATIONS, isRtl, negotiateTranslation, wordFor, type Translation } from '../lib/i18n';
-import { type Html, buildId, fragmentCache, pageState, renderPage } from '../lib/layout';
+import { type Html, buildId, fragmentCache, pageState, renderPage, renderPageHtml } from '../lib/layout';
 import { liveSnapshot } from '../lib/live';
 import { renderOgCardHtml } from '../lib/og-card';
 import { wantsJson } from '../lib/security';
@@ -27,7 +28,7 @@ import { SOCIAL_HEAD, SOCIAL_SCRIPT, socialHomePanels } from './social';
 import { emailSignupForm } from './subscribe';
 import { webhookForm } from './webhooks';
 
-export const pageRoutes = new Hono<AppEnv>();
+export const pageRoutes = new Hono<AppEnv>({ router: new LinearRouter() });
 
 // ─── Small, pure helpers (exported for tests) ────────────────────────────────
 
@@ -271,30 +272,251 @@ function answerWords(word: string): Html {
 
 // ─── Home ────────────────────────────────────────────────────────────────────
 
+/**
+ * The rendered home page is the same for everyone a datacentre serves, apart from a few
+ * per-request bits (the slots below), so it's kept in the edge cache (caches.default, which is
+ * per datacentre). On a quiet site nearly every request lands in a fresh isolate, where
+ * rendering the page is most of the CPU; a hit skips the Durable Object call, the updates read
+ * and the render. The key holds everything else the page shows: the state, the London date, the
+ * build, the newest update (the Dispatches list) and the checklist tally (the readiness meter),
+ * so none of that is ever served stale. Only the live numbers (viewers, checks, vibes and the
+ * anxiety meter) can be, for at most this long, and app.js and social.js replace them as soon as
+ * the live connection says hello.
+ */
+export const HOME_CACHE_SECONDS = 300;
+/** When the cached copy was rendered (epoch ms). Only ever on the cached copy. */
+const HOME_RENDERED_AT = 'X-Home-Rendered-At';
+/** Where each slot goes in the cached copy: `name:byteOffset,…`, in order. Only on the cached copy. */
+const HOME_SLOTS = 'X-Home-Slots';
+const HTML_TYPE = { 'Content-Type': 'text/html; charset=UTF-8' } as const;
+
+/** The edge cache, where there is one (not in unit tests; a no-op on workers.dev). */
+function edgeCache(): Cache | null {
+	try {
+		return typeof caches === 'undefined' ? null : caches.default;
+	} catch {
+		return null;
+	}
+}
+
+/** What the home page shows beyond the state and the live numbers. */
+export interface HomeContent {
+	/** The newest update's id (0 for none): the Dispatches list only ever gains updates. */
+	latestUpdateId: number;
+	readiness: ReadinessSummary;
+}
+
+/** The newest update and the checklist tally, in one D1 read. Null if it fails. */
+async function homeContent(env: Env): Promise<HomeContent | null> {
+	try {
+		const row = await env.DB.prepare(
+			`SELECT (SELECT COALESCE(MAX(id), 0) FROM updates) AS latest, COUNT(*) AS total,
+			 COALESCE(SUM(CASE WHEN done = 1 THEN 1 ELSE 0 END), 0) AS done FROM checklist`,
+		).first<{ latest: number; total: number; done: number }>();
+		const latestUpdateId = Number(row?.latest ?? 0);
+		const total = Number(row?.total ?? 0);
+		const done = Number(row?.done ?? 0);
+		if (!row || !Number.isFinite(latestUpdateId)) return null;
+		return { latestUpdateId, readiness: { done, total, percent: readinessPercent(done, total) } };
+	} catch (err) {
+		console.error('home: content read failed:', err);
+		return null;
+	}
+}
+
+/**
+ * Cache key for the rendered home page: everything it shows that isn't a slot or a live number.
+ * The visitor's language and location are slots, so one copy serves everyone. Not a routable
+ * path, and nothing in it comes from the request beyond the origin.
+ */
+export function homeCacheKey(origin: string, state: SiteState, today: string, build: ReturnType<typeof buildId>, content: HomeContent): string {
+	const parts = [
+		state.status,
+		state.statusChangedAt,
+		state.dueDate ?? '-',
+		today,
+		build ? `${build.tag ?? build.id}@${build.timestamp ?? ''}` : 'local',
+		content.latestUpdateId,
+		`${content.readiness.done}-${content.readiness.total}`,
+	];
+	return `${origin}/__cache/home/v1/${parts.map((p) => encodeURIComponent(p)).join('/')}`;
+}
+
+/** The per-request parts of the home page, as markup. The page is rendered with a marker for each. */
+export type HomeSlots = Record<'greeting' | 'colo' | 'language' | 'now' | 'londonNow' | 'asOf' | 'foreign' | 'clock' | 'speak', string>;
+type SlotName = keyof HomeSlots;
+
+const SLOT_OPEN = '<!--home:';
+const SLOT_CLOSE = '-->';
+const SLOT_NAMES: ReadonlySet<string> = new Set<SlotName>(['greeting', 'colo', 'language', 'now', 'londonNow', 'asOf', 'foreign', 'clock', 'speak']);
+const slot = (name: SlotName) => raw(`${SLOT_OPEN}${name}${SLOT_CLOSE}`);
+
+/** The home page as UTF-8 pieces with the slots between them: `parts.length === names.length + 1`. */
+export interface HomeTemplate {
+	parts: Uint8Array[];
+	names: SlotName[];
+}
+
+/** Cut rendered markup at its slot markers (the markers go; anything that isn't one stays). */
+export function homeTemplate(markup: string): HomeTemplate {
+	const encoder = new TextEncoder();
+	const parts: Uint8Array[] = [];
+	const names: SlotName[] = [];
+	let from = 0;
+	for (let at = markup.indexOf(SLOT_OPEN); at !== -1; at = markup.indexOf(SLOT_OPEN, at + 1)) {
+		const end = markup.indexOf(SLOT_CLOSE, at + SLOT_OPEN.length);
+		if (end === -1) break;
+		const name = markup.slice(at + SLOT_OPEN.length, end);
+		if (!SLOT_NAMES.has(name)) continue;
+		parts.push(encoder.encode(markup.slice(from, at)));
+		names.push(name as SlotName);
+		from = end + SLOT_CLOSE.length;
+	}
+	parts.push(encoder.encode(markup.slice(from)));
+	return { parts, names };
+}
+
+/** The page for one request: the template's pieces with this request's slots between them. */
+export function fillHome(template: HomeTemplate, slots: HomeSlots): Blob {
+	const body: Array<Uint8Array | string> = [template.parts[0] as Uint8Array];
+	for (let i = 0; i < template.names.length; i++) body.push(slots[template.names[i] as SlotName], template.parts[i + 1] as Uint8Array);
+	return new Blob(body);
+}
+
+/** Everything on the home page that depends on the visitor or the moment, escaped. */
+function homeSlots(state: SiteState, now: Date, geo: Geo, t: Translation, clock: Countdown): HomeSlots {
+	const iso = now.toISOString();
+	const status = state.status;
+	return {
+		greeting: String(html`${greeting(geo)}`),
+		colo: geo.colo ? String(html`<span class="mc-sep">·</span> <span>Served from ${geo.colo}</span>`) : '',
+		language: String(
+			t.lang === 'en'
+				? html`<p>Your browser speaks English, so the answer is simply ${byStatus({ no: 'no', soon: 'not yet', yes: 'yes' }, status, { tag: 'span', className: 'answer-inline' })}.</p>`
+				: html`<p>Your browser prefers ${t.name}, so: ${byStatus(
+						{ no: t.no, soon: t.notYet, yes: t.yes },
+						status,
+						{ tag: 'span', className: 'answer-inline', lang: t.lang },
+					)}.</p>`,
+		),
+		now: String(html`${iso}`),
+		londonNow: String(html`${formatLondon(iso, { weekday: undefined, year: undefined })}`),
+		asOf: String(html`${formatLondon(iso, { weekday: undefined, year: undefined, second: '2-digit' })}`),
+		foreign:
+			t.lang !== 'en'
+				? String(html`<p class="hero-foreign">${byStatus({ no: t.no, soon: t.notYet, yes: t.yes }, status, { lang: t.lang, className: 'foreign-word' })}<span class="muted"> · ${t.name}, as your browser requested</span></p>`)
+				: '',
+		clock: String(html`${clock.value}`),
+		speak: String(html`data-speak-lang="${t.lang}" data-speak-word-no="${wordFor(t, 'no')}" data-speak-word-soon="${wordFor(t, 'soon')}" data-speak-word-yes="${wordFor(t, 'yes')}"`),
+	};
+}
+
+/** A fresh-enough cached home page, or null. */
+async function cachedHome(cache: Cache, key: string): Promise<HomeTemplate | null> {
+	const hit = await cache.match(key).catch((err: unknown) => {
+		console.error('home cache read failed:', err);
+		return undefined;
+	});
+	if (!hit) return null;
+	// Only trusted for HOME_CACHE_SECONDS from when it was rendered: not every cache (wrangler
+	// dev's, for one) expires entries by max-age.
+	const renderedAt = Number(hit.headers.get(HOME_RENDERED_AT));
+	const age = Date.now() - renderedAt;
+	const layout = hit.headers.get(HOME_SLOTS);
+	if (!Number.isFinite(renderedAt) || age < 0 || age >= HOME_CACHE_SECONDS * 1000 || layout === null) {
+		await hit.body?.cancel();
+		return null;
+	}
+	const bytes = new Uint8Array(await hit.arrayBuffer());
+	const parts: Uint8Array[] = [];
+	const names: SlotName[] = [];
+	let from = 0;
+	for (const entry of layout ? layout.split(',') : []) {
+		const colon = entry.indexOf(':');
+		const name = entry.slice(0, colon);
+		const at = Number(entry.slice(colon + 1));
+		if (colon === -1 || !SLOT_NAMES.has(name) || !Number.isSafeInteger(at) || at < from || at > bytes.length) return null;
+		parts.push(bytes.subarray(from, at));
+		names.push(name as SlotName);
+		from = at;
+	}
+	parts.push(bytes.subarray(from));
+	return { parts, names };
+}
+
+function storeHome(c: Context<AppEnv>, cache: Cache, key: string, template: HomeTemplate): void {
+	let offset = 0;
+	const layout = template.names.map((name, i) => `${name}:${(offset += (template.parts[i] as Uint8Array).byteLength)}`).join(',');
+	const copy = new Response(new Blob(template.parts), {
+		headers: {
+			...HTML_TYPE,
+			'Cache-Control': `public, max-age=${HOME_CACHE_SECONDS}`,
+			[HOME_RENDERED_AT]: String(Date.now()),
+			[HOME_SLOTS]: layout,
+		},
+	});
+	const put = cache.put(key, copy).catch((err: unknown) => console.error('home cache write failed:', err));
+	try {
+		c.executionCtx.waitUntil(put);
+	} catch {
+		// No execution context (tests): the put just runs unawaited.
+	}
+}
+
+function homeResponse(c: Context<AppEnv>, body: Blob): Response {
+	const res = c.body(body, undefined, HTML_TYPE);
+	res.headers.set('Cache-Control', 'no-cache');
+	res.headers.append('Vary', 'Accept-Language');
+	return res;
+}
+
 pageRoutes.get('/', async (c) => {
 	const state = c.get('state');
-	const status = state.status;
-	const copy = STATUS_COPY[status];
 	const now = new Date();
 	const today = londonDate(now);
-	const geo = geoFromRequest(c.req.raw);
 	const translation = negotiateTranslation(c.req.header('accept-language'));
 	const build = buildId(c.env);
+	const clock = countdownCopy(state, now);
+	const slots = homeSlots(state, now, geoFromRequest(c.req.raw), translation, clock);
 
+	const cache = edgeCache();
+	const content = cache ? await homeContent(c.env) : null;
+	const cacheKey = cache && content ? homeCacheKey(new URL(c.req.url).origin, state, today, build, content) : null;
+	if (cache && cacheKey) {
+		const cached = await cachedHome(cache, cacheKey);
+		if (cached) return homeResponse(c, fillHome(cached, slots));
+	}
+	const { template, complete } = await renderHome(c, { state, today, build, clock, content });
+	if (cache && cacheKey && complete) storeHome(c, cache, cacheKey, template);
+	return homeResponse(c, fillHome(template, slots));
+});
+
+/**
+ * The home page with a marker for each slot, and whether it's complete enough to cache. Its own
+ * function so a cache hit never compiles it: V8 compiles a function whole on its first call.
+ */
+async function renderHome(
+	c: Context<AppEnv>,
+	{ state, today, build, clock, content }: { state: SiteState; today: string; build: ReturnType<typeof buildId>; clock: Countdown; content: HomeContent | null },
+): Promise<{ template: HomeTemplate; complete: boolean }> {
+	const status = state.status;
+	const copy = STATUS_COPY[status];
 	// One WaitingRoom RPC carries viewers, vibes and the check total; getCheckTotal (D1) only
 	// if the room couldn't answer.
-	const [stats, updates, readiness] = await Promise.all([
+	const [stats, recent, readiness] = await Promise.all([
 		liveSnapshot(c.env),
-		safe('updates', () => listUpdates(c.env, { limit: 5 }), [] as Update[]),
-		safe<ReadinessSummary | null>('readiness', () => getReadinessSummary(c.env), null),
+		safe<Update[] | null>('updates', () => listUpdates(c.env, { limit: 5 }), null),
+		content ? content.readiness : safe<ReadinessSummary | null>('readiness', () => getReadinessSummary(c.env), null),
 	]);
+	const updates = recent ?? [];
 	const checks = stats.checks ?? (await safe('checks', () => getCheckTotal(c.env), 0));
-	const clock = countdownCopy(state, now);
+	// Only a complete page is worth sharing: not one with the room down or the updates missing.
+	const complete = stats.checks !== undefined && recent !== null;
 	// The forecast and fruit panels only change with the status, the due date and the London
 	// date, so each isolate renders them once per combination (see fragmentCache).
 	const dayKey = `${status}|${state.dueDate ?? ''}|${today}`;
 
-	const hero = homeHero(state, translation, now);
+	const hero = homeHero(state);
 	const body = html`${hero}
 <section class="mission" id="mission-control" aria-labelledby="mc-title">
 	<div class="wrap">
@@ -306,22 +528,16 @@ pageRoutes.get('/', async (c) => {
 			<p class="mc-status mono tiny">
 				<span class="led" aria-hidden="true"></span>
 				<span data-conn-label>Telemetry: standing by</span>
-				${geo.colo ? html`<span class="mc-sep">·</span> <span>Served from ${geo.colo}</span>` : ''}
+				${slot('colo')}
 				<span class="mc-sep">·</span> <span>Build ${build ? (build.tag ?? build.id) : 'local'}</span>
 			</p>
 		</header>
 
 		<div class="mc-grid">
 			${panel('greeting', '01', 'Greeting', 'span-6', html`
-				<p class="panel-big">${greeting(geo)}</p>
-				${translation.lang === 'en'
-					? html`<p>Your browser speaks English, so the answer is simply ${byStatus({ no: 'no', soon: 'not yet', yes: 'yes' }, status, { tag: 'span', className: 'answer-inline' })}.</p>`
-					: html`<p>Your browser prefers ${translation.name}, so: ${byStatus(
-							{ no: translation.no, soon: translation.notYet, yes: translation.yes },
-							status,
-							{ tag: 'span', className: 'answer-inline', lang: translation.lang },
-						)}.</p>`}
-				<p class="tiny muted">It is <time datetime="${now.toISOString()}">${formatLondon(now.toISOString(), { weekday: undefined, year: undefined })}</time> in London, where the answer is kept.</p>
+				<p class="panel-big">${slot('greeting')}</p>
+				${slot('language')}
+				<p class="tiny muted">It is <time datetime="${slot('now')}">${slot('londonNow')}</time> in London, where the answer is kept.</p>
 			`)}
 			${panel('viewers', '02', 'Audience', 'span-3', html`
 				<p class="big-number" data-live="viewers">${formatCount(stats.viewers)}</p>
@@ -334,7 +550,7 @@ pageRoutes.get('/', async (c) => {
 			${panel('clock', '04', 'Countdown', 'span-8', html`
 				<div class="clock" data-clock>
 					<p class="clock-label" data-clock-label>${clock.label}</p>
-					<p class="clock-value" data-clock-value>${clock.value}</p>
+					<p class="clock-value" data-clock-value>${slot('clock')}</p>
 					<p class="clock-note" data-clock-note>${clock.note}</p>
 				</div>
 				<p class="tiny muted">The answer last changed ${changedAtTag(state.statusChangedAt)} UK time<span data-local-time></span>.</p>
@@ -367,7 +583,7 @@ pageRoutes.get('/', async (c) => {
 			${panel('instruments', '11', 'Instruments', 'span-5', html`
 				<p>For when reading is too much effort, or not dramatic enough.</p>
 				<div class="cluster">
-					<button class="btn" type="button" data-speak data-speak-lang="${translation.lang}" data-speak-word-no="${wordFor(translation, 'no')}" data-speak-word-soon="${wordFor(translation, 'soon')}" data-speak-word-yes="${wordFor(translation, 'yes')}" data-js-only hidden><span aria-hidden="true">🔊</span> Listen</button>
+					<button class="btn" type="button" data-speak ${slot('speak')} data-js-only hidden><span aria-hidden="true">🔊</span> Listen</button>
 					<button class="btn" type="button" data-drumroll data-js-only hidden><span aria-hidden="true">🥁</span> Drumroll, please</button>
 				</div>
 				<p class="tiny muted">Spoken by your browser's own voice and drummed by its own audio hardware. No servers, files or musicians were involved.</p>
@@ -389,7 +605,7 @@ pageRoutes.get('/', async (c) => {
 <div class="vibe-layer" data-vibe-layer aria-hidden="true"></div>
 ${updateTemplateCache('', updateTemplate)}`;
 
-	const res = await renderPage(c, {
+	const markup = await renderPageHtml(c, {
 		title: `${SITE_NAME} ${copy.short}`,
 		description: `${copy.sentence} Live, with an unreasonable amount of supporting telemetry.`,
 		path: '/',
@@ -397,12 +613,11 @@ ${updateTemplateCache('', updateTemplate)}`;
 		head: SOCIAL_HEAD,
 		scripts: [SOCIAL_SCRIPT],
 	});
-	res.headers.set('Cache-Control', 'no-cache');
-	res.headers.append('Vary', 'Accept-Language');
-	return res;
-});
+	return { template: homeTemplate(markup), complete };
+}
 
-function homeHero(state: SiteState, t: Translation, now: Date): Html {
+/** The hero, with slots for the moment it's served and the visitor's language. */
+function homeHero(state: SiteState): Html {
 	const copy = STATUS_COPY[state.status];
 	const word = copy.word;
 	return html`<section class="hero" aria-labelledby="hero-title">
@@ -418,12 +633,10 @@ function homeHero(state: SiteState, t: Translation, now: Date): Html {
 	</h1>
 	<p class="hero-asof">
 		<span>as of</span>
-		<time datetime="${now.toISOString()}" data-asof>${formatLondon(now.toISOString(), { weekday: undefined, year: undefined, second: '2-digit' })} UK time</time>
+		<time datetime="${slot('now')}" data-asof>${slot('asOf')} UK time</time>
 		<span class="conn" data-conn-text>live updates need JavaScript</span>
 	</p>
-	${t.lang !== 'en'
-		? html`<p class="hero-foreign">${byStatus({ no: t.no, soon: t.notYet, yes: t.yes }, state.status, { lang: t.lang, className: 'foreign-word' })}<span class="muted"> · ${t.name}, as your browser requested</span></p>`
-		: ''}
+	${slot('foreign')}
 	<a class="hero-cue" href="#mission-control"><span>Mission control</span> <span aria-hidden="true" class="cue-arrow">↓</span></a>
 </section>`;
 }

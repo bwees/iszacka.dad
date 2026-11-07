@@ -317,11 +317,15 @@ export function countryName(code: string): string {
 	return regionName(upper) ?? upper;
 }
 
+type ColoCities = Readonly<Record<string, readonly [city: string, country: string]>>;
+let coloCityTable: ColoCities | undefined;
+
 /**
  * Common Cloudflare datacentres by IATA code: [city, ISO country]. Not
  * exhaustive (there are 300-odd); unknown codes are shown as the bare code.
+ * Built on first use: module scope runs on every cold isolate, and most requests never ask.
  */
-export const COLO_CITIES: Readonly<Record<string, readonly [city: string, country: string]>> = {
+export const coloCities = (): ColoCities => (coloCityTable ??= {
 	// Britain & Ireland
 	LHR: ['London', 'GB'],
 	MAN: ['Manchester', 'GB'],
@@ -441,7 +445,7 @@ export const COLO_CITIES: Readonly<Record<string, readonly [city: string, countr
 	PER: ['Perth', 'AU'],
 	ADL: ['Adelaide', 'AU'],
 	AKL: ['Auckland', 'NZ'],
-};
+});
 
 export interface ColoInfo {
 	/** Upper-case IATA code (or 'XXX'). */
@@ -460,7 +464,7 @@ export function coloInfo(code: string | null | undefined): ColoInfo {
 	if (!/^[A-Z]{3}$/.test(upper) || upper === 'XXX') {
 		return { code: 'XXX', city: null, country: null, label: 'an undisclosed datacentre' };
 	}
-	const known = COLO_CITIES[upper];
+	const known = coloCities()[upper];
 	if (known) return { code: upper, city: known[0], country: known[1], label: known[0] };
 	return { code: upper, city: null, country: null, label: `somewhere with a runway called ${upper}` };
 }

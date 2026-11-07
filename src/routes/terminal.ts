@@ -6,6 +6,7 @@
 
 import { type Context, Hono } from 'hono';
 import { html, raw } from 'hono/html';
+import { LinearRouter } from 'hono/router/linear-router';
 import { GRADIENTS, ACCENT, isTerminalClient } from '../lib/ascii';
 import { LIVE_MAX_MINUTES, type Line, type LiveModel, liveFrameLines } from '../lib/ascii-live';
 import { getCheckTotal } from '../lib/counters';
@@ -30,7 +31,7 @@ import { formatLondon, formatLondonDate } from '../lib/time';
 import type { AppEnv, SiteState, Status } from '../types';
 import { MAX_TERMINALS } from '../do/waiting-room-protocol';
 
-export const terminalRoutes = new Hono<AppEnv>();
+export const terminalRoutes = new Hono<AppEnv>({ router: new LinearRouter() });
 
 const TEXT = 'text/plain; charset=utf-8';
 const NO_STORE = 'no-store';
