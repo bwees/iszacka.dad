@@ -260,8 +260,10 @@ ${opts.noindex ? html`<meta name="robots" content="noindex, nofollow">` : ''}
 <link rel="preload" href="/fonts/anybody-latin.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="/fonts/atkinson-next-latin.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/delights.css">
 ${opts.turnstile ? raw('<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>') : ''}
 <script type="module" src="/app.js"></script>
+<script type="module" src="/delights.js"></script>
 ${scripts.map((src) => html`<script type="module" src="${src}"></script>`)}
 <script type="application/json" id="site-copy">${raw(clientCopyJson())}</script>
 ${opts.head ?? ''}

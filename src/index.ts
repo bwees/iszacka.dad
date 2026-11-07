@@ -21,6 +21,10 @@ import { pushRoutes } from './routes/push';
 import { resendWebhookRoutes } from './routes/resend-webhook';
 import { subscribeRoutes } from './routes/subscribe';
 import { webhookRoutes } from './routes/webhooks';
+import { corporateRoutes } from './routes/corporate';
+import { delightsRoutes } from './routes/delights';
+import { socialRoutes } from './routes/social';
+import { terminalRoutes } from './routes/terminal';
 import type { AppEnv, SiteState } from './types';
 
 export { WaitingRoom } from './do/waiting-room';
@@ -95,6 +99,10 @@ app.route('/', webhookRoutes);
 app.route('/', communityRoutes);
 app.route('/', funRoutes);
 app.route('/', ledgerRoutes);
+app.route('/', terminalRoutes);
+app.route('/', socialRoutes);
+app.route('/', delightsRoutes);
+app.route('/', corporateRoutes);
 app.route('/admin', adminRoutes);
 
 app.notFound(notFoundHandler);

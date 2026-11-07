@@ -552,6 +552,9 @@ function handleSnapshot(data) {
 
 function handleMessage(msg) {
 	if (!msg || typeof msg !== 'object') return;
+	// Extension point: every live message is re-dispatched as a DOM event, so feature modules
+	// (delights.js, social.js, ...) can react without editing this file.
+	document.dispatchEvent(new CustomEvent('iszacka:live', { detail: msg }));
 	switch (msg.type) {
 		case 'hello':
 			handleSnapshot(msg);
@@ -1117,6 +1120,7 @@ function chiptune() {
 
 let konamiOpen = false;
 function konami() {
+	document.dispatchEvent(new CustomEvent('iszacka:konami'));
 	if (konamiOpen) return;
 	konamiOpen = true;
 	const copy = site.copy[state.status];
@@ -1341,3 +1345,16 @@ function boot() {
 }
 
 boot();
+
+// ─── Extension API for feature modules ──────────────────────────────────────
+// Feature modules (loaded after this one) use these instead of reaching into app.js internals.
+// Events on document: 'iszacka:live' (detail: LiveMessage), 'iszacka:konami'.
+window.iszacka = Object.freeze({
+	/** The full celebration (confetti + fireworks), honouring reduced motion. */
+	celebrate: () => celebrate(),
+	/** Say something through the polite aria-live region. */
+	announce: (text) => announce(String(text)),
+	/** The current status: 'no' | 'soon' | 'yes'. */
+	status: () => state.status,
+});
+
