@@ -99,8 +99,8 @@ mail.
 ### Optional: a DNS-only token for the Worker
 
 By default the deploy hands the Worker `CLOUDFLARE_API_TOKEN` as its `DNS_API_TOKEN` (it already
-has DNS Edit on the zone). Set a narrower `DNS_API_TOKEN` secret (Zone Read + DNS Edit on
-`iszacka.dad` only) if you'd rather the Worker didn't hold the deploy token; it takes precedence.
+has DNS Edit on the zone). Set a narrower `DNS_EDIT_TOKEN` (or `DNS_API_TOKEN`) secret (Zone Read + DNS Edit on
+`iszacka.dad` only) so the Worker doesn't hold the deploy token; it takes precedence.
 
 With a `DNS_API_TOKEN`, the Worker keeps a TXT record in sync with the answer, so
 `dig +short TXT answer.iszacka.dad` answers the question too. It's written when a change of
@@ -131,7 +131,7 @@ gh secret set CLOUDFLARE_API_TOKEN --repo zackpollard/iszacka.dad
 | `CLOUDFLARE_ACCOUNT_ID` | Yes | Your Cloudflare account ID |
 | `ADMIN_PASSWORD` | Yes, for `/admin` | The admin password. Make it long; it guards the big red button. `openssl rand -base64 24` will do |
 | `RESEND_API_KEY` | Yes, for email | The full-access Resend key from step 2 |
-| `DNS_API_TOKEN` | Optional | A DNS-only token for the Worker; falls back to `CLOUDFLARE_API_TOKEN` |
+| `DNS_EDIT_TOKEN` | Optional | A DNS-only token for the Worker (`DNS_API_TOKEN` also works); falls back to `CLOUDFLARE_API_TOKEN` |
 | `DNS_ZONE_ID` | Optional | The `iszacka.dad` zone ID, so the DNS token doesn't need Zone Read |
 | `PREVIEW_ADMIN_PASSWORD` | Optional | The `/admin` password for PR previews (`openssl rand -base64 24`). Without it, preview admin is switched off. Never post it anywhere public: previews are reachable by anyone |
 | `TURNSTILE_SITE_KEY` | Don't set | The Setup workflow stores it on the Worker. Set it here only to override that |
