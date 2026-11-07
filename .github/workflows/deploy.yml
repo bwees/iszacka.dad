@@ -60,7 +60,38 @@ jobs:
               missing=1
             fi
           done
-          exit "$missing"
+          [[ $missing == 0 ]] || exit 1
+
+          # Probe what the token can actually do. This repo's Actions logs are public, so only
+          # pass/fail and Cloudflare error codes are printed: never ids, names or response bodies.
+          api() { curl -sS --max-time 20 -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4$1"; }
+          probe() { # <label> <path> → prints ✅/❌ and returns 0/1
+            local body ok code
+            body=$(api "$2" || echo '{}')
+            ok=$(jq -r '.success // false' <<<"$body" 2>/dev/null || echo false)
+            code=$(jq -r '[.errors[]?.code] | map(tostring) | join(",")' <<<"$body" 2>/dev/null || true)
+            if [[ $ok == true ]]; then echo "✅ $1"; return 0; fi
+            echo "❌ $1${code:+ (Cloudflare error $code)}"; return 1
+          }
+          shape=no; [[ $CLOUDFLARE_ACCOUNT_ID =~ ^[0-9a-f]{32}$ ]] && shape=yes
+          echo "CLOUDFLARE_ACCOUNT_ID looks like a 32-character hex id: $shape"
+          user_tok=0; acct_tok=0
+          probe "token is a valid user API token" "/user/tokens/verify" && user_tok=1 || true
+          probe "token is a valid account API token for CLOUDFLARE_ACCOUNT_ID" "/accounts/$CLOUDFLARE_ACCOUNT_ID/tokens/verify" && acct_tok=1 || true
+          failed=0
+          probe "D1 (list databases) on CLOUDFLARE_ACCOUNT_ID" "/accounts/$CLOUDFLARE_ACCOUNT_ID/d1/database?per_page=1" || failed=1
+          probe "Workers Scripts (list) on CLOUDFLARE_ACCOUNT_ID" "/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts" || failed=1
+          probe "zone ${SITE_URL#https://} is visible" "/zones?name=${SITE_URL#https://}" || failed=1
+          zones=$(api "/zones?name=${SITE_URL#https://}" | jq -r '.result | length' 2>/dev/null || echo 0)
+          [[ $zones == 1 ]] && echo "✅ zone ${SITE_URL#https://} found" || { echo "❌ zone ${SITE_URL#https://} not found (is it in this account, and is the token scoped to it?)"; failed=1; }
+          if [[ $user_tok == 0 && $acct_tok == 0 ]]; then
+            echo "::error title=Cloudflare token::CLOUDFLARE_API_TOKEN isn't a valid token (neither user nor account token)."
+            exit 1
+          fi
+          if [[ $failed == 1 ]]; then
+            echo "::error title=Cloudflare token::The token can't do everything the deploy needs; see the ❌ lines above and docs/SETUP.md for the permission list."
+            exit 1
+          fi
 
       - name: Resolve the D1 database
         id: d1
