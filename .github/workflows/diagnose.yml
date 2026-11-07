@@ -42,11 +42,11 @@ jobs:
           r /webhooks | jq -r '.data[]? | "endpoint=\(.endpoint) status=\(.status) events=\(.events | join(","))"'
           echo "── Latest received emails (addresses and subjects redacted)"
           r "/emails/receiving?limit=5" | jq -r '
-            if .data then .data[] | "\(.created_at)  to-domain=\([.to[]? | sub(".*@";"")] | unique | join(","))  id=…\(.id[-4:])"
+            if .data then .data[] | "\(.created_at)  to=\(if ([.to[]? | test("@iszacka\\.dad")] | any) then "iszacka.dad" else "external" end)  id=…\(.id[-4:])"
             else "list failed: \(.name // "?") \(.message // "" | gsub("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+";"<email>"))" end'
           echo "── Latest sent emails (recipients redacted to their domain)"
           r "/emails?limit=8" | jq -r '
-            if .data then .data[] | "\(.created_at)  from=\(.from | sub(".*<";"") | sub(">.*";""))  to-domain=\([.to[]? | sub(".*@";"") | sub(">.*";"")] | unique | join(","))  last_event=\(.last_event // "?")"
+            if .data then .data[] | "\(.created_at)  from=\(.from | sub(".*<";"") | sub(">.*";""))  to=\(if ([.to[]? | test("@iszacka\\.dad")] | any) then "iszacka.dad" else "external" end)  last_event=\(.last_event // "?")"
             else "list failed: \(.name // "?") \(.message // "" | gsub("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+";"<email>"))" end'
           id=$(r "/emails/receiving?limit=1" | jq -r '.data[0].id // empty')
           if [[ -n $id ]]; then
