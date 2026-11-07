@@ -82,8 +82,16 @@ jobs:
           probe "D1 (list databases) on CLOUDFLARE_ACCOUNT_ID" "/accounts/$CLOUDFLARE_ACCOUNT_ID/d1/database?per_page=1" || failed=1
           probe "Workers Scripts (list) on CLOUDFLARE_ACCOUNT_ID" "/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts" || failed=1
           probe "zone ${SITE_URL#https://} is visible" "/zones?name=${SITE_URL#https://}" || failed=1
-          zones=$(api "/zones?name=${SITE_URL#https://}" | jq -r '.result | length' 2>/dev/null || echo 0)
-          [[ $zones == 1 ]] && echo "✅ zone ${SITE_URL#https://} found" || { echo "❌ zone ${SITE_URL#https://} not found (is it in this account, and is the token scoped to it?)"; failed=1; }
+          zone_id=$(api "/zones?name=${SITE_URL#https://}" | jq -r '.result[0].id // empty' 2>/dev/null || true)
+          if [[ -n $zone_id ]]; then
+            echo "✅ zone ${SITE_URL#https://} found"
+            probe "Workers Routes (list) on the zone" "/zones/$zone_id/workers/routes" || failed=1
+            # Needed by the Setup workflow, not by this deploy: report, don't fail.
+            probe "DNS (list records) on the zone [setup job]" "/zones/$zone_id/dns_records?per_page=1" || echo "::warning title=Cloudflare token::No DNS access; the Setup workflow needs DNS Edit."
+          else
+            echo "❌ zone ${SITE_URL#https://} not found (is it in this account, and is the token scoped to it?)"; failed=1
+          fi
+          probe "Turnstile (list widgets) [setup job]" "/accounts/$CLOUDFLARE_ACCOUNT_ID/challenges/widgets?per_page=1" || echo "::warning title=Cloudflare token::No Turnstile access; the Setup workflow needs Turnstile Edit."
           if [[ $user_tok == 0 && $acct_tok == 0 ]]; then
             echo "::error title=Cloudflare token::CLOUDFLARE_API_TOKEN isn't a valid token (neither user nor account token)."
             exit 1
