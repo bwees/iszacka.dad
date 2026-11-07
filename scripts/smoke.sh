@@ -552,6 +552,8 @@ asset /offline.html '^text/html'
 asset /social.js 'javascript'
 asset /social.css '^text/css'
 asset /world-map.LICENSE.txt '^text/plain'
+asset /stork.js 'javascript'
+asset /corporate.css '^text/css'
 
 begin "GET /world-map.svg is a world map keyed by country"
 request GET /world-map.svg
@@ -899,6 +901,96 @@ expect_status 200
 expect_type '^image/png'
 expect_nonempty
 finish
+
+# ─── The small print, heritage channels and the stork ─────────────────────────
+
+section "Corporate & Catch the Stork"
+
+html_page /press 'smaller than 400px'
+html_page /privacy 'github\.com/zackpollard/iszacka\.dad/issues'
+html_page /terms 'England and Wales'
+html_page /stork 'data-stork-canvas'
+
+begin "GET /everything offers the heritage channels"
+request GET /everything --header "Accept: $HTML_ACCEPT"
+expect_status 200
+expect_body 'action="/pigeon"'
+expect_body 'action="/smoke-signal"'
+expect_body 'action="/fax"'
+finish
+
+# These store nothing (they never even read the form), so they're safe without --mutate.
+begin "POST /pigeon dispatches a pigeon"
+request POST /pigeon --header "Origin: $ORIGIN" --header "Accept: $HTML_ACCEPT" --data 'to=smoke-test-windowsill'
+expect_status 200
+expect_type '^text/html'
+expect_body 'Pigeon dispatched'
+expect_body 'ETA 3–5 business years'
+expect_no_body_i 'smoke-test-windowsill'
+finish
+
+begin "POST /smoke-signal lights a fire (JSON)"
+request POST /smoke-signal --header "Origin: $ORIGIN" --header 'Accept: application/json'
+expect_status 200
+expect_json '.ok == true and .stored == false and .method == "smoke-signal"'
+finish
+
+begin "POST /fax asks for your fax number in 1997"
+request POST /fax --header "Origin: $ORIGIN" --header "Accept: $HTML_ACCEPT" --data 'fax=01632960000'
+expect_status 200
+expect_body 'Please send your fax number to 1997'
+expect_no_body_i '01632960000'
+finish
+
+begin "GET /pigeon sends you back to /everything"
+request GET /pigeon
+expect_status 303
+expect_header location '/everything#pigeon'
+finish
+
+json_endpoint /api/stork/scores '.scores | type == "array"'
+
+begin "POST /api/stork/start issues a game token"
+request POST /api/stork/start --header "Origin: $ORIGIN" --header 'Accept: application/json'
+expect_status 200
+expect_header cache-control 'no-store'
+expect_json '.ok == true and (.token | test("^[0-9a-z]+\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{43}$"))'
+finish
+STORK_TOKEN=$(jq -r '.token // empty' "$BODY" 2>/dev/null || true)
+
+# Turnstile runs first: 403 where it's enforced with real keys (production), else the check
+# behind it answers. The dummy token passes Cloudflare's test keys (previews).
+begin "POST /api/stork/score refuses a score without a game"
+request POST /api/stork/score --header "Origin: $ORIGIN" --header 'Accept: application/json' \
+	--data 'initials=ABC&score=1&token=smoke-not-a-token&cf-turnstile-response=XXXX.DUMMY.TOKEN.XXXX'
+expect_status 400 403
+expect_json '.ok == false and (.code == "token_malformed" or .code == "turnstile")'
+finish
+
+begin "POST /api/stork/score refuses an implausible score"
+request POST /api/stork/score --header "Origin: $ORIGIN" --header 'Accept: application/json' \
+	--data-urlencode "token=$STORK_TOKEN" --data 'initials=ABC&score=99999&cf-turnstile-response=XXXX.DUMMY.TOKEN.XXXX'
+expect_status 400 403
+expect_json '.ok == false and (.code == "implausible" or .code == "turnstile")'
+finish
+
+if [[ $MUTATE == 1 && -n $STORK_TOKEN ]]; then
+	# A real score goes on the (local or preview) leaderboard; five a day per connection.
+	begin "POST /api/stork/score lodges a plausible score once (--mutate)"
+	request POST /api/stork/score --header "Origin: $ORIGIN" --header 'Accept: application/json' \
+		--data-urlencode "token=$STORK_TOKEN" --data 'initials=QAT&score=1&cf-turnstile-response=XXXX.DUMMY.TOKEN.XXXX'
+	expect_status 201 429
+	if [[ $STATUS == 201 ]]; then
+		expect_json '.ok == true and .initials == "QAT" and (.rank | type == "number")'
+		request POST /api/stork/score --header "Origin: $ORIGIN" --header 'Accept: application/json' \
+			--data-urlencode "token=$STORK_TOKEN" --data 'initials=QAT&score=1&cf-turnstile-response=XXXX.DUMMY.TOKEN.XXXX'
+		expect_status 409
+		expect_json '.code == "duplicate"'
+	else
+		expect_json '.code == "daily_limit"'
+	fi
+	finish
+fi
 
 # ─── Admin (anonymous) ─────────────────────────────────────────────────────────
 

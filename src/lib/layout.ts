@@ -122,6 +122,15 @@ export const FOOTER_SECTIONS: ReadonlyArray<{ title: string; links: readonly Nav
 			{ href: '/poster', label: 'Fridge poster' },
 		],
 	},
+	{
+		title: 'The small print',
+		links: [
+			{ href: '/press', label: 'Press kit' },
+			{ href: '/privacy', label: 'Privacy policy' },
+			{ href: '/terms', label: 'Terms of service' },
+			{ href: '/stork', label: 'Catch the Stork (a game)' },
+		],
+	},
 ];
 
 /** Used when a page renders before (or without) the root middleware loading state, e.g. on a D1 outage. */

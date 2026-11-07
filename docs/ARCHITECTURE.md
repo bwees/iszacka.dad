@@ -212,10 +212,13 @@ domain, ~66 KB) is fetched only when scrolled near, then shaded from `/api/count
 | ledger | `src/lib/ledger.ts`, `src/lib/og.ts`, `src/routes/ledger.ts`, `test/ledger-*` | Dad Ledger (verification memoised per isolate), `/og.png` (serves the pre-rendered card) |
 | infra | `.github/**`, `scripts/setup-cloudflare.sh`, `scripts/smoke.sh`, `README.md`, `CLAUDE.md`, `docs/SETUP.md` | CI/CD, previews, one-time Cloudflare setup, smoke tests, docs |
 | social | `src/routes/social.ts`, `src/lib/social.ts`, `src/lib/dadcon.ts`, `public/social.js`, `public/social.css`, `public/world-map.svg`, `public/world-map.LICENSE.txt`, the social parts of `src/do/waiting-room.ts`, `test/social-*` | DADCON, live check feed, live world map, milestones, global anxiety meter (home panels CH-12 to CH-15) |
+| corporate | `src/routes/corporate.ts`, `src/lib/corporate.ts`, `src/lib/stork.ts`, `public/stork.js`, `public/corporate.css`, `migrations/0012_stork.sql`, `test/corporate-*`, `test/stork-*` | press kit, privacy policy + terms (kept accurate by tests against the schema and the CSS), pigeon / smoke signal / fax on /everything, Catch the Stork + leaderboard |
 
 Reserved migration files, if you need schema additions (prefer not to): `0002_realtime`,
 `0003_email` (used: `email_sends`), `0004_push`, `0005_admin`, `0006_community`, `0007_fun`,
-`0008_ledger`, `0009_feeds`, `0010_frontend`, `0011_resend` (used: `resend_events`).
+`0008_ledger`, `0009_feeds`, `0010_frontend`, `0011_resend` (used: `resend_events`), `0012_stork`
+(used: `stork_scores`). A new table also needs a row on `/privacy` (`PRIVACY_TABLES` in
+`lib/corporate.ts`); `test/corporate-pages.test.ts` fails until it has one.
 
 ## Cross-module contracts (stubs exist; keep exported signatures exactly)
 
@@ -245,7 +248,8 @@ Reserved migration files, if you need schema additions (prefer not to): `0002_re
 - `lib/i18n.ts`: `TRANSLATIONS`, `answerInLanguage(acceptLanguage, status)`
 - `lib/ascii.ts`: `isTerminalClient(ua)`, `renderAscii(state, {checks})`
 - Fragments for `/everything`: `emailSignupForm(c)` (`routes/subscribe.ts`), `pushWidget(c)` (needs
-  `/push.js`) (`routes/push.ts`), `webhookForm(c)` (`routes/webhooks.ts`)
+  `/push.js`) (`routes/push.ts`), `webhookForm(c)` (`routes/webhooks.ts`), `pigeonForm()`,
+  `smokeSignalForm()`, `faxForm()` (`routes/corporate.ts`)
 
 ## URL map
 
@@ -261,6 +265,7 @@ Reserved migration files, if you need schema additions (prefer not to): `0002_re
 | fun | `/pool`, `/status`, `/certificate`, `/poster`, `/admin/pool` |
 | ledger | `/ledger`, `/api/ledger`, `/.well-known/dad-ledger.json`, `/og.png` |
 | social | `/api/countries` (checks per country, cached ~60 s, CORS `*`); static `/social.js`, `/social.css`, `/world-map.svg`, `/world-map.LICENSE.txt` |
+| corporate | `/press`, `/privacy`, `/terms`, `/pigeon`, `/smoke-signal`, `/fax` (POST: a result page, nothing read or stored; GET redirects back to the method on /everything), `/stork`, `/api/stork/start` (POST), `/api/stork/score` (POST), `/api/stork/scores`; static `/stork.js`, `/corporate.css` |
 
 Email addresses: `stork@iszacka.dad` sends notifications and `answer@iszacka.dad` sends
 auto-replies, both through Resend. Resend receives any `*@iszacka.dad`, and the Worker auto-replies;

@@ -21,6 +21,7 @@ import { daysBetween, formatDayMonth, formatLondon, formatLondonDate, formatNumb
 import { getSetting } from '../lib/state';
 import { getUpdate, listUpdates } from '../lib/updates';
 import { STATUSES, isStatus, type AppEnv, type SiteState, type Status, type Update, type UpdateKind } from '../types';
+import { faxForm, pigeonForm, smokeSignalForm } from './corporate';
 import { pushWidget } from './push';
 import { SOCIAL_HEAD, SOCIAL_SCRIPT, socialHomePanels } from './social';
 import { emailSignupForm } from './subscribe';
@@ -682,6 +683,10 @@ const METHODS: Method[] = [
 	{ id: 'embed', title: 'Embed', blurb: 'Put the answer on your own site.' },
 	{ id: 'app', title: 'Install as an app', blurb: 'A home-screen icon for one bit of information.' },
 	{ id: 'llms', title: 'llms.txt', blurb: 'For visiting language models.' },
+	// Heritage channels (routes/corporate.ts): they store nothing and deliver less.
+	{ id: 'pigeon', title: 'Carrier pigeon', blurb: 'Tracked, insured, unhurried.' },
+	{ id: 'smoke-signal', title: 'Smoke signal', blurb: 'Line of sight required. Weather permitting.' },
+	{ id: 'fax', title: 'Fax', blurb: 'For the discerning 1997 enthusiast.' },
 ];
 
 function methodSection(n: number, m: Method, body: Html): Html {
@@ -788,6 +793,9 @@ pageRoutes.get('/everything', async (c) => {
 		<p><button class="btn btn-primary" type="button" data-install hidden>Install the app</button></p>`)}
 	${section('llms', html`<p>A plain-text briefing for language models, so they stop guessing. Also: <a href="/humans.txt">humans.txt</a>, for humans.</p>
 		${snippet('snip-llms', `curl ${base}/llms.txt`)}`)}
+	${section('pigeon', html`<p>A trained pigeon carries the answer to an address of your choosing. We don't keep the address, so the pigeon has to remember it.</p>${fragment('pigeon', () => pigeonForm())}`)}
+	${section('smoke-signal', html`<p>For anyone within sight of a hill. The answer goes up in smoke, as answers do.</p>${fragment('smoke-signal', () => smokeSignalForm())}`)}
+	${section('fax', html`<p>Leave your fax number and the answer will be faxed to you at the earliest opportunity, historically speaking.</p>${fragment('fax', () => faxForm())}`)}
 </div>`;
 
 	return renderPage(c, {

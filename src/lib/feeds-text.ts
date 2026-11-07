@@ -26,6 +26,10 @@ export const PUBLIC_PAGES: ReadonlyArray<{ path: string; changefreq: 'always' | 
 	{ path: '/stats', changefreq: 'hourly', priority: 0.5 }, // realtime
 	{ path: '/subscribe', changefreq: 'weekly', priority: 0.5 }, // email
 	{ path: '/api', changefreq: 'weekly', priority: 0.5 }, // feeds
+	{ path: '/stork', changefreq: 'daily', priority: 0.4 }, // corporate
+	{ path: '/press', changefreq: 'weekly', priority: 0.3 }, // corporate
+	{ path: '/privacy', changefreq: 'weekly', priority: 0.3 }, // corporate
+	{ path: '/terms', changefreq: 'weekly', priority: 0.3 }, // corporate
 ];
 
 function dueSummary(state: SiteState, today: string): string {
