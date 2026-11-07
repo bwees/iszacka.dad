@@ -30,6 +30,7 @@ export const PUBLIC_PAGES: ReadonlyArray<{ path: string; changefreq: 'always' | 
 	{ path: '/press', changefreq: 'weekly', priority: 0.3 }, // corporate
 	{ path: '/privacy', changefreq: 'weekly', priority: 0.3 }, // corporate
 	{ path: '/terms', changefreq: 'weekly', priority: 0.3 }, // corporate
+	{ path: '/achievements', changefreq: 'weekly', priority: 0.3 }, // delights
 ];
 
 function dueSummary(state: SiteState, today: string): string {

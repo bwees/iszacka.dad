@@ -93,6 +93,7 @@ export const FOOTER_SECTIONS: ReadonlyArray<{ title: string; links: readonly Nav
 			{ href: '/ready', label: 'Dad readiness' },
 			{ href: '/wall', label: 'Congratulations wall' },
 			{ href: '/names', label: 'Name suggestion box' },
+			{ href: '/achievements', label: 'Achievements' },
 		],
 	},
 	{

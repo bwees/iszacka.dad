@@ -500,6 +500,7 @@ html_page /names
 html_page /ledger
 html_page /subscribe '<form'
 html_page /api
+html_page /achievements 'data-achievements'
 
 begin "Unknown pages get a 404 page"
 request GET /smoke-test-this-page-does-not-exist
@@ -564,6 +565,8 @@ expect_body 'data-cc="GB"'
 expect_body 'Natural Earth'
 if [[ $(wc -c <"$BODY") -gt 153600 ]]; then problem "bigger than 150 KB"; fi
 finish
+asset /delights.js 'javascript'
+asset /delights.css '^text/css'
 
 begin "GET /manifest.webmanifest is a web app manifest"
 request GET /manifest.webmanifest

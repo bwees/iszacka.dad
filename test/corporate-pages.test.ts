@@ -112,7 +112,7 @@ describe('/privacy', () => {
 			.filter((f) => f.endsWith('.js'))
 			.map((f) => readFileSync(join(ROOT, 'public', f), 'utf8'))
 			.join('\n');
-		for (const key of ['stork-best', 'stork-initials', 'stork-sound', "'checks'", "'celebrated'"]) expect(scripts, key).toContain(key);
+		for (const key of ['stork-best', 'stork-initials', 'stork-sound', "'checks'", "'celebrated'", "'iszackadad:delights'"]) expect(scripts, key).toContain(key);
 	});
 });
 

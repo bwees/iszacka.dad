@@ -412,7 +412,7 @@ function renderPrivacy(): Html {
 		<ul>
 			<li>how many times you've checked the answer from the homepage (you may not want to know);</li>
 			<li>whether you've already had the YES celebration, so it only ambushes you once;</li>
-			<li>achievements you've unlocked, and similar party tricks;</li>
+			<li>achievements you've unlocked, and what counts towards them: which of the site's pages you've read, which days you've visited and how many good vibes you've sent;</li>
 			<li>Catch the Stork: your personal best, your last initials, and whether you turned the sound on.</li>
 		</ul>
 		<p>One more lives in session storage, which forgets it when you close the tab: when the page last reloaded itself after a site update, so it can never get stuck reloading.</p>

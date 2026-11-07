@@ -213,6 +213,7 @@ domain, ~66 KB) is fetched only when scrolled near, then shaded from `/api/count
 | infra | `.github/**`, `scripts/setup-cloudflare.sh`, `scripts/smoke.sh`, `README.md`, `CLAUDE.md`, `docs/SETUP.md` | CI/CD, previews, one-time Cloudflare setup, smoke tests, docs |
 | social | `src/routes/social.ts`, `src/lib/social.ts`, `src/lib/dadcon.ts`, `public/social.js`, `public/social.css`, `public/world-map.svg`, `public/world-map.LICENSE.txt`, the social parts of `src/do/waiting-room.ts`, `test/social-*` | DADCON, live check feed, live world map, milestones, global anxiety meter (home panels CH-12 to CH-15) |
 | corporate | `src/routes/corporate.ts`, `src/lib/corporate.ts`, `src/lib/stork.ts`, `public/stork.js`, `public/corporate.css`, `migrations/0012_stork.sql`, `test/corporate-*`, `test/stork-*` | press kit, privacy policy + terms (kept accurate by tests against the schema and the CSS), pigeon / smoke signal / fax on /everything, Catch the Stork + leaderboard |
+| delights | `public/delights.js`, `public/delights.css`, `src/routes/delights.ts`, `test/delights-*` | browser-only toys: achievements, screensaver, the due date in other calendars, night-feed mode, torch mode, away title |
 
 Reserved migration files, if you need schema additions (prefer not to): `0002_realtime`,
 `0003_email` (used: `email_sends`), `0004_push`, `0005_admin`, `0006_community`, `0007_fun`,
@@ -266,11 +267,38 @@ Reserved migration files, if you need schema additions (prefer not to): `0002_re
 | ledger | `/ledger`, `/api/ledger`, `/.well-known/dad-ledger.json`, `/og.png` |
 | social | `/api/countries` (checks per country, cached ~60 s, CORS `*`); static `/social.js`, `/social.css`, `/world-map.svg`, `/world-map.LICENSE.txt` |
 | corporate | `/press`, `/privacy`, `/terms`, `/pigeon`, `/smoke-signal`, `/fax` (POST: a result page, nothing read or stored; GET redirects back to the method on /everything), `/stork`, `/api/stork/start` (POST), `/api/stork/score` (POST), `/api/stork/scores`; static `/stork.js`, `/corporate.css` |
+| delights | `/achievements`; static `/delights.js`, `/delights.css` |
 
 Email addresses: `stork@iszacka.dad` sends notifications and `answer@iszacka.dad` sends
 auto-replies, both through Resend. Resend receives any `*@iszacka.dad`, and the Worker auto-replies;
 advertise `ask@iszacka.dad`. To enter the pool by email, send a subject containing
 "guess" with a body like `14 Nov 15:30` (and optionally `Name: Alex`).
+
+## Browser delights (`public/delights.js`)
+
+Client-only, with no server state and no network requests; `/achievements` is an empty
+`renderPage` shell (`[data-achievements]`) that the script fills in. It runs after `/app.js` and
+uses only its extension points: `window.iszacka` (`celebrate`, `announce`, `status`) and the
+`iszacka:konami` event. Status and due-date changes are watched on `<html data-status
+data-due-date>` (a MutationObserver), which app.js updates for the WebSocket and polling alike.
+
+- **Achievements** (22): one localStorage key, `iszackadad:delights` (`{v, unlocked, queue,
+  vibes, pages, days}`, sanitised on every read; in memory when storage is unavailable). Check
+  counts come from app.js's `iszackadad:checks`. Unlocks toast in a polite live region; ones
+  unlocked on the way out of a page (a click to `/live`) toast on the next page.
+- **Screensaver** (home, 60 s without input, never with reduced motion): the answer bounces
+  DVD-style, changing colour at most every 400 ms; a corner hit (one axis bouncing within 4 px
+  of the other wall) fires a small local burst and an achievement. Any input exits.
+- **Other calendars** (home panel CH-16, last on the grid, hidden without a due date):
+  Hebrew, Islamic (Umm al-Qura), Persian and Chinese via the browser's `Intl` calendars;
+  Julian, Discordian and a TNG-style stardate (1,000 a year from 2323, TrekGuide's fan
+  formula) computed.
+- **Night-feed mode**: after YES, 02:00 to 05:00 Europe/London (computed without `Intl`),
+  `body.night-feed` swaps the tokens for a dim red night-light and shows a "shh" note.
+- **Torch mode** (a button in the Instruments panel): a photosensitivity notice, then full
+  screen Morse code of the answer with a 250 ms dot, so at most two flashes a second.
+- **Away title**: while the tab is hidden the title reads "(still no) Is Zack a Dad?" (per
+  status); a change to NOT YET or YES while hidden flashes it until the tab is seen again.
 
 ## UI kit (frontend styles these; everyone else uses only these classes + semantic HTML)
 
