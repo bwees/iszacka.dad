@@ -174,11 +174,28 @@ fails cleanly (`no_api_key`) and nothing else breaks.
 ## Live protocol (`/ws` WebSocket, `/api/stream` SSE: realtime agent server, frontend client)
 
 Server → client `LiveMessage` (see `src/types.ts`): `hello` (on connect: state, viewers, vibes,
-checks, reloadNonce), `state`, `update`, `viewers`, `vibes` (`{vibes, emoji}`), `checks` (at most
-once a second), `reload`.
+checks, reloadNonce, anxiety), `state`, `update`, `viewers`, `vibes` (`{vibes, emoji, country?}`:
+the sender's country, when known), `checks` (at most once a second), `reload`.
 Client → server: `{type:'vibe', emoji}` (rate-limited per socket), `{type:'ping'}`. The client
 reconnects with backoff. On `reload` with a nonce different from the one it booted with, it does
 `location.reload()`.
+
+Social messages (`src/lib/social.ts`, computed in the WaitingRoom from the checks it already
+tallies; no extra D1 writes, and nothing per person beyond a country code):
+- `checkfeed` (`{items: [{country, n}], more?}`): who just checked, by ISO 3166-1 alpha-2 code
+  (`XX` unknown, `T1` Tor). The first check goes out at once, the rest at most every 3 s, and only
+  while someone is connected.
+- `milestone` (`{n, country}`): the check that took the total to 100, 250, 500, 1k, 2.5k, 5k, 10k,
+  25k…, once ever (the last one is kept in DO storage, `social_milestone`).
+- `anxiety` (`{level, perMinute}`): checks a minute over a sliding 5-minute window; `calm`,
+  `elevated` (3+ checks in 5 minutes), `frantic` (15+), `meltdown` (50+). Sent only when the level
+  changes. The only alarms it adds are the few moments the level would fall, and only while a
+  viewer is connected; the window is saved (`social_pulse`) when no checks are waiting, i.e.
+  before the object can hibernate. `liveSnapshot()` carries it too, for the home page's render.
+
+`public/social.js` (home page only) turns these into the DADCON, anxiety, live map and
+"who just checked" panels, and milestone toasts. The map (`/world-map.svg`, Natural Earth, public
+domain, ~66 KB) is fetched only when scrolled near, then shaded from `/api/countries`.
 
 ## Ownership (agents edit only their files; new files only under their own names/prefixes)
 
@@ -194,6 +211,7 @@ reconnects with backoff. On `reload` with a nonce different from the one it boot
 | fun | `src/lib/pool.ts`, `src/lib/forecast.ts`, `src/lib/fruit.ts`, `src/routes/fun.ts`, `test/fun-*` | baby pool, status page, certificate, fridge poster, forecast + fruit maths |
 | ledger | `src/lib/ledger.ts`, `src/lib/og.ts`, `src/routes/ledger.ts`, `test/ledger-*` | Dad Ledger (verification memoised per isolate), `/og.png` (serves the pre-rendered card) |
 | infra | `.github/**`, `scripts/setup-cloudflare.sh`, `scripts/smoke.sh`, `README.md`, `CLAUDE.md`, `docs/SETUP.md` | CI/CD, previews, one-time Cloudflare setup, smoke tests, docs |
+| social | `src/routes/social.ts`, `src/lib/social.ts`, `src/lib/dadcon.ts`, `public/social.js`, `public/social.css`, `public/world-map.svg`, `public/world-map.LICENSE.txt`, the social parts of `src/do/waiting-room.ts`, `test/social-*` | DADCON, live check feed, live world map, milestones, global anxiety meter (home panels CH-12 to CH-15) |
 
 Reserved migration files, if you need schema additions (prefer not to): `0002_realtime`,
 `0003_email` (used: `email_sends`), `0004_push`, `0005_admin`, `0006_community`, `0007_fun`,
@@ -205,7 +223,9 @@ Reserved migration files, if you need schema additions (prefer not to): `0002_re
   `WaitingRoom.recordCheck` RPC; the room tallies in memory and writes D1 in batches),
   `getCheckTotal(env)` (one `checkTotal()` RPC, cached 2 s per isolate; D1 if the room is down)
 - `do/waiting-room.ts`: class `WaitingRoom` with `fetch()` (ws + sse), RPCs `broadcast(msg)`, `stats()`,
-  `liveSnapshot()` (`{viewers, vibes, checks, reloadNonce}`), `recordCheck(check)`, `checkTotal()`
+  `liveSnapshot()` (`{viewers, vibes, checks, reloadNonce, anxiety}`), `recordCheck(check)`, `checkTotal()`
+- `routes/social.ts`: `socialHomePanels(state, {today, anxiety})` (the home page's CH-12 to CH-15),
+  `SOCIAL_HEAD` + `SOCIAL_SCRIPT` (`/social.css`, `/social.js`) for pages that show them
 - `lib/ledger.ts`: `appendLedger(env, {status, note})`, `getLedger(env, {limit})`, type `LedgerEntry`
 - `lib/og.ts`: `ogCardPath(status)`, `ogVersionStatus(v)`. Nothing renders at request time: `/og.png`
   serves `public/og/<status>.png` from `ASSETS` (the status from a valid `?v=<status>-<ms>`, cached
@@ -240,6 +260,7 @@ Reserved migration files, if you need schema additions (prefer not to): `0002_re
 | community | `/ready`, `/wall`, `/names`, `/names/:id/vote`, `/admin/checklist`, `/admin/wall`, `/admin/names` |
 | fun | `/pool`, `/status`, `/certificate`, `/poster`, `/admin/pool` |
 | ledger | `/ledger`, `/api/ledger`, `/.well-known/dad-ledger.json`, `/og.png` |
+| social | `/api/countries` (checks per country, cached ~60 s, CORS `*`); static `/social.js`, `/social.css`, `/world-map.svg`, `/world-map.LICENSE.txt` |
 
 Email addresses: `stork@iszacka.dad` sends notifications and `answer@iszacka.dad` sends
 auto-replies, both through Resend. Resend receives any `*@iszacka.dad`, and the Worker auto-replies;

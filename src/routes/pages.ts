@@ -22,6 +22,7 @@ import { getSetting } from '../lib/state';
 import { getUpdate, listUpdates } from '../lib/updates';
 import { STATUSES, isStatus, type AppEnv, type SiteState, type Status, type Update, type UpdateKind } from '../types';
 import { pushWidget } from './push';
+import { SOCIAL_HEAD, SOCIAL_SCRIPT, socialHomePanels } from './social';
 import { emailSignupForm } from './subscribe';
 import { webhookForm } from './webhooks';
 
@@ -371,6 +372,7 @@ pageRoutes.get('/', async (c) => {
 				<p class="tiny muted">Spoken by your browser's own voice and drummed by its own audio hardware. No servers, files or musicians were involved.</p>
 				<noscript><p class="tiny muted">These instruments need JavaScript. Imagine a drumroll.</p></noscript>
 			`)}
+			${socialHomePanels(state, { today, anxiety: stats.anxiety })}
 		</div>
 	</div>
 	${tickerCache(status, () => ticker(status))}
@@ -391,6 +393,8 @@ ${updateTemplateCache('', updateTemplate)}`;
 		description: `${copy.sentence} Live, with an unreasonable amount of supporting telemetry.`,
 		path: '/',
 		body,
+		head: SOCIAL_HEAD,
+		scripts: [SOCIAL_SCRIPT],
 	});
 	res.headers.set('Cache-Control', 'no-cache');
 	res.headers.append('Vary', 'Accept-Language');

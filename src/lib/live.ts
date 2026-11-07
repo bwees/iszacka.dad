@@ -1,6 +1,6 @@
 // Fan-out to every open browser via the single global WaitingRoom Durable Object.
 
-import type { LiveMessage } from '../types';
+import type { AnxietyReading, LiveMessage } from '../types';
 
 export const WAITING_ROOM_NAME = 'global';
 
@@ -34,6 +34,8 @@ export interface LiveSnapshot {
 	checks?: number;
 	/** The current reload nonce; missing (never empty) when the Durable Object is unavailable. */
 	reloadNonce?: string;
+	/** Social: the global anxiety meter; missing when the Durable Object is unavailable. */
+	anxiety?: AnxietyReading;
 }
 
 /**

@@ -29,8 +29,15 @@
 // every CHECK_TICK_MS, and writes them as soon as traffic goes quiet. A restart (deploy) can
 // still lose the few seconds' worth that were waiting; that's fine for a vanity counter.
 //
+// Social (src/lib/social.ts): each counted check also feeds a per-country `checkfeed` broadcast
+// (at most every 3 s, only while someone is watching), a five-minute anxiety meter (an `anxiety`
+// broadcast when its level changes) and round-number `milestone`s. All of it rides on the
+// existing per-check work; the only extra alarms are the held-back feed and the moments the
+// meter's level falls, and only while a viewer is connected.
+//
 // Storage: SQLite-backed. `vibes` holds all-time counts per emoji; the sync KV holds the
-// opening date and the salt for client tags. The last broadcast viewer count is kept in
+// opening date, the salt for client tags, the last milestone celebrated and the anxiety window
+// (saved only when the object may be about to hibernate). The last broadcast viewer count is kept in
 // memory on purpose: after a wake or restart the first alarm always re-broadcasts it, so
 // clients that reconnected mid-count are corrected.
 
@@ -41,13 +48,15 @@ import {
 	checkUpserts,
 	emptyCheckTallies,
 	mergeCheckTallies,
+	normaliseCountry,
 	parseCheckEvent,
 	tallyCheck,
 } from '../lib/counters';
 import { randomToken, rateLimitSubject, sha256Hex } from '../lib/security';
+import { milestoneAtOrBelow, milestoneReached, type PulseOutput, SocialPulse } from '../lib/social';
 import { getSetting, getState } from '../lib/state';
 import { nowIso } from '../lib/time';
-import type { LiveMessage, SiteState } from '../types';
+import type { AnxietyReading, LiveMessage, SiteState } from '../types';
 import {
 	CHECK_RETRY_MS,
 	CHECK_TICK_MS,
@@ -81,6 +90,8 @@ interface SocketAttachment {
 	/** Frame budget window: when it started, and frames received in it. */
 	frameWindowStart: number;
 	frames: number;
+	/** Social: the client's country (ISO 3166-1 alpha-2, or 'T1'), so its vibes can float from it on the map. */
+	country?: string;
 }
 
 interface StreamClient {
@@ -119,6 +130,9 @@ const RELOAD_NONCE_TTL_MS = 30_000;
 const LEGACY_LAST_VIEWERS_KEY = 'last_viewers';
 const OPENED_AT_KEY = 'opened_at';
 const CLIENT_SALT_KEY = 'client_tag_salt';
+/** Social: the last milestone celebrated (so none is ever announced twice) and the anxiety window. */
+const MILESTONE_KEY = 'social_milestone';
+const PULSE_KEY = 'social_pulse';
 
 const WS_CLOSING = 2;
 const WS_CLOSED = 3;
@@ -172,6 +186,10 @@ export class WaitingRoom extends DurableObject<Env> {
 	#sockets: number | null = null;
 	/** When the alarm is set for: undefined until read from storage, null for none. */
 	#alarmAt: number | null | undefined = undefined;
+	/** Social: the check feed and the anxiety meter. */
+	readonly #pulse: SocialPulse;
+	/** Social: the last milestone celebrated; null until read from storage. */
+	#lastMilestone: number | null = null;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -186,6 +204,7 @@ export class WaitingRoom extends DurableObject<Env> {
 		this.#vibeTotal = Number(sql.exec<{ total: number }>('SELECT COALESCE(SUM(count), 0) AS total FROM vibes').one().total) || 0;
 		if (kv.get(OPENED_AT_KEY) === undefined) kv.put(OPENED_AT_KEY, nowIso());
 		if (kv.get(LEGACY_LAST_VIEWERS_KEY) !== undefined) kv.delete(LEGACY_LAST_VIEWERS_KEY);
+		this.#pulse = new SocialPulse(kv.get(PULSE_KEY));
 		ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(PING_FRAME, PONG_FRAME));
 	}
 
@@ -216,9 +235,9 @@ export class WaitingRoom extends DurableObject<Env> {
 	 * nonce, so a tab that can't hold a WebSocket still obeys "reload every browser". The nonce
 	 * is cached for 30s.
 	 */
-	async liveSnapshot(): Promise<{ viewers: number; vibes: number; checks: number; reloadNonce: string }> {
+	async liveSnapshot(): Promise<{ viewers: number; vibes: number; checks: number; reloadNonce: string; anxiety: AnxietyReading }> {
 		const [checks, reloadNonce] = await Promise.all([this.#checkTotal(), this.#currentReloadNonce()]);
-		return { viewers: this.#viewerCount(), vibes: this.#vibeTotal, checks, reloadNonce };
+		return { viewers: this.#viewerCount(), vibes: this.#vibeTotal, checks, reloadNonce, anxiety: this.#pulse.reading(Date.now()) };
 	}
 
 	/**
@@ -234,6 +253,7 @@ export class WaitingRoom extends DurableObject<Env> {
 		this.#lastCheckAt = now;
 		if (this.#storedChecks === null && now >= this.#checksRetryAt) await this.#syncChecks();
 		this.#checksChanged(Date.now());
+		await this.#socialCheck(check.country, now);
 		if (this.#pendingChecks.total > 0) await this.#ensureAlarmSafely(now + CHECK_TICK_MS);
 	}
 
@@ -323,6 +343,7 @@ export class WaitingRoom extends DurableObject<Env> {
 				this.#fanOut({ type: 'viewers', viewers });
 			}
 			await this.#checksAlarm();
+			await this.#socialTick();
 			if (this.#streams.size > 0) {
 				this.#heartbeat();
 				await this.#ensureAlarm(Date.now() + HEARTBEAT_MS);
@@ -346,11 +367,20 @@ export class WaitingRoom extends DurableObject<Env> {
 		this.ctx.acceptWebSocket(server, tag ? [tag] : []);
 		if (this.#sockets !== null) this.#sockets += 1;
 		const now = Date.now();
-		server.serializeAttachment({ connectedAt: now, vibes: [], frameWindowStart: now, frames: 0 } satisfies SocketAttachment);
+		const country = socketCountry(request);
+		server.serializeAttachment({
+			connectedAt: now,
+			vibes: [],
+			frameWindowStart: now,
+			frames: 0,
+			...(country ? { country } : {}),
+		} satisfies SocketAttachment);
 		this.#send(server, JSON.stringify({ ...hello, viewers: this.#viewerCount() } satisfies HelloMessage));
 		// The hello may already be out of date by the time the alarm runs: always correct it.
 		this.#lastViewers = null;
 		await this.#viewersChanged();
+		// Someone is watching now, so a raised anxiety meter needs an alarm to fall on time.
+		await this.#socialTick();
 		return new Response(null, { status: 101, webSocket: client });
 	}
 
@@ -391,7 +421,8 @@ export class WaitingRoom extends DurableObject<Env> {
 		this.#pendingVibes.set(vibe.base, { n: (entry?.n ?? 0) + 1, lastAt: nowIso() });
 		ws.serializeAttachment({ ...attachment, vibes: personal.times } satisfies SocketAttachment);
 		this.#vibeTotal += 1;
-		this.#fanOut({ type: 'vibes', vibes: this.#vibeTotal, emoji: vibe.emoji });
+		const { country } = attachment;
+		this.#fanOut({ type: 'vibes', vibes: this.#vibeTotal, emoji: vibe.emoji, ...(country ? { country } : {}) });
 		this.ctx.waitUntil(this.#viewersChanged()); // schedules the flush (at most one alarm a second)
 	}
 
@@ -566,6 +597,7 @@ export class WaitingRoom extends DurableObject<Env> {
 			vibes: this.#vibeTotal,
 			checks,
 			reloadNonce,
+			anxiety: this.#pulse.reading(Date.now()),
 		};
 	}
 
@@ -685,6 +717,66 @@ export class WaitingRoom extends DurableObject<Env> {
 		if (this.#pendingChecks.total > 0) await this.#ensureAlarm(Date.now() + CHECK_TICK_MS);
 	}
 
+	// ── Social: check feed, anxiety meter, milestones ─────────────────────────
+
+	/** One counted check's social side: the feed, the meter and milestones. Never throws. */
+	async #socialCheck(country: string, now: number): Promise<void> {
+		try {
+			const out = this.#pulse.check(country, now, this.#viewerCount() > 0);
+			this.#milestone(country);
+			await this.#socialOut(out, now);
+		} catch (err) {
+			console.error('waiting room: social check failed', err);
+		}
+	}
+
+	/** The alarm's (or a new viewer's) turn: a held-back feed, a falling meter. Never throws. */
+	async #socialTick(): Promise<void> {
+		try {
+			const now = Date.now();
+			await this.#socialOut(this.#pulse.tick(now, this.#viewerCount() > 0), now);
+		} catch (err) {
+			console.error('waiting room: social tick failed', err);
+		}
+	}
+
+	async #socialOut(out: PulseOutput, now: number): Promise<void> {
+		for (const msg of out.messages) this.#fanOut(msg);
+		// With nothing waiting for D1 the object may hibernate, which forgets memory, so keep the
+		// meter's window (only if it changed). Under steady traffic checks are always waiting, so
+		// this is one small write per burst of checks, not one per check.
+		if (this.#pendingChecks.total === 0) {
+			const snapshot = this.#pulse.snapshot(now);
+			if (snapshot !== null) this.ctx.storage.kv.put(PULSE_KEY, snapshot);
+		}
+		if (out.wakeAt !== null) await this.#ensureAlarmSafely(out.wakeAt);
+	}
+
+	/**
+	 * Celebrate the check that takes the total past a round number, once ever. The first time
+	 * the total is known with nothing stored (a fresh deploy), the milestones already behind it
+	 * are recorded without a fuss.
+	 */
+	#milestone(country: string): void {
+		if (this.#storedChecks === null) return; // the total is unknown until D1 answers
+		const total = this.#knownChecks();
+		const { kv } = this.ctx.storage;
+		if (this.#lastMilestone === null) {
+			const stored = kv.get(MILESTONE_KEY);
+			if (typeof stored === 'number' && Number.isFinite(stored)) {
+				this.#lastMilestone = stored;
+			} else {
+				this.#lastMilestone = milestoneAtOrBelow(total - 1);
+				kv.put(MILESTONE_KEY, this.#lastMilestone);
+			}
+		}
+		const reached = milestoneReached(this.#lastMilestone, total);
+		if (reached === null) return;
+		this.#lastMilestone = reached;
+		kv.put(MILESTONE_KEY, reached);
+		this.#fanOut({ type: 'milestone', n: reached, country });
+	}
+
 	// ── Alarm ─────────────────────────────────────────────────────────────────
 
 	/** Schedule a (coalesced) viewer-count broadcast. */
@@ -726,14 +818,23 @@ function readAttachment(ws: WebSocket): SocketAttachment {
 	const raw: unknown = ws.deserializeAttachment();
 	const now = Date.now();
 	if (typeof raw !== 'object' || raw === null) return { connectedAt: now, vibes: [], frameWindowStart: now, frames: 0 };
-	const { connectedAt, vibes, frameWindowStart, frames } = raw as Partial<Record<keyof SocketAttachment, unknown>>;
+	const { connectedAt, vibes, frameWindowStart, frames, country } = raw as Partial<Record<keyof SocketAttachment, unknown>>;
+	const code = country === undefined ? 'XX' : normaliseCountry(country);
 	return {
 		connectedAt: typeof connectedAt === 'number' ? connectedAt : now,
 		vibes: Array.isArray(vibes) ? vibes.filter((t): t is number => typeof t === 'number') : [],
 		// Attachments from before the frame budget existed start a fresh window.
 		frameWindowStart: typeof frameWindowStart === 'number' ? frameWindowStart : now,
 		frames: typeof frames === 'number' ? frames : 0,
+		...(code !== 'XX' ? { country: code } : {}),
 	};
+}
+
+/** Social: where a connecting client is (the country, nothing finer), from Cloudflare's request metadata. */
+function socketCountry(request: Request): string | undefined {
+	const cf = (request as Request & { cf?: { country?: unknown } }).cf;
+	const code = normaliseCountry(typeof cf?.country === 'string' ? cf.country : request.headers.get('cf-ipcountry'));
+	return code === 'XX' ? undefined : code;
 }
 
 function tooManySockets(): Response {

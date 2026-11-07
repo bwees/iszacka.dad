@@ -32,3 +32,13 @@
 /sw.js
   Cache-Control: no-cache
   Service-Worker-Allowed: /
+
+# Social panels (home page). The world map almost never changes: a day, then revalidate.
+/social.js
+  Cache-Control: public, max-age=300, stale-while-revalidate=60
+
+/social.css
+  Cache-Control: public, max-age=300, stale-while-revalidate=60
+
+/world-map.svg
+  Cache-Control: public, max-age=86400, stale-while-revalidate=604800

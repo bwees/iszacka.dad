@@ -549,6 +549,19 @@ asset /embed.js 'javascript'
 asset /push.js 'javascript'
 asset /sw.js 'javascript'
 asset /offline.html '^text/html'
+asset /social.js 'javascript'
+asset /social.css '^text/css'
+asset /world-map.LICENSE.txt '^text/plain'
+
+begin "GET /world-map.svg is a world map keyed by country"
+request GET /world-map.svg
+expect_status 200
+expect_type '^image/svg\+xml'
+expect_body '<svg'
+expect_body 'data-cc="GB"'
+expect_body 'Natural Earth'
+if [[ $(wc -c <"$BODY") -gt 153600 ]]; then problem "bigger than 150 KB"; fi
+finish
 
 begin "GET /manifest.webmanifest is a web app manifest"
 request GET /manifest.webmanifest
@@ -672,6 +685,27 @@ json_endpoint /api/history
 json_endpoint /api/updates
 json_endpoint /api/live
 
+begin "GET /api/countries counts checks per country, cached, for anyone"
+request GET /api/countries --header 'Accept: application/json' --header 'Origin: https://example.com'
+expect_status 200
+expect_type 'json'
+expect_dynamic_headers
+expect_header access-control-allow-origin '^\*$'
+expect_header cache-control 'max-age=[0-9]+'
+expect_json '(.countries | type == "array") and (.total | type == "number") and all(.countries[]; (.country | test("^([A-Z]{2}|T1)$")) and (.n | type == "number") and (.name | type == "string"))'
+finish
+
+begin "GET / has the social panels (DADCON, anxiety, map, feed)"
+request GET / --header "Accept: $HTML_ACCEPT"
+expect_status 200
+expect_body 'data-dadcon'
+expect_body 'DADCON [0-5]'
+expect_body 'data-anxiety data-level="(calm|elevated|frantic|meltdown)"'
+expect_body 'data-world-map'
+expect_body 'data-checkfeed'
+expect_body 'src="/social\.js"'
+finish
+
 begin "GET /api/dad is $([[ $CURRENT == yes ]] && echo '201 Created' || echo '425 Too Early')"
 request GET /api/dad --header 'Accept: application/json'
 if [[ $CURRENT == yes ]]; then expect_status 201; else expect_status 425; fi
@@ -750,6 +784,49 @@ finish
 section "Live"
 
 websocket_check "WebSocket /ws says hello" "$CURRENT"
+
+# node: connect, expect the hello to carry the anxiety meter, then check (GET /) and wait for the
+# checkfeed broadcast that says someone (us) just did.
+# shellcheck disable=SC2016 # JavaScript, not shell.
+SOCIAL_WS_SCRIPT='
+const [url, base, ua] = process.argv.slice(1);
+let stage = "hello";
+let anxiety = null;
+const fail = (message) => { console.error(message); process.exit(1); };
+const timer = setTimeout(() => fail(`timed out waiting for ${stage}`), 15000);
+const ws = new WebSocket(url);
+ws.addEventListener("error", () => fail("WebSocket error"));
+ws.addEventListener("close", (event) => { if (stage !== "done") fail(`closed during ${stage} (code ${event.code})`); });
+ws.addEventListener("message", async (event) => {
+	let msg;
+	try { msg = JSON.parse(String(event.data)); } catch { return fail("non-JSON message"); }
+	if (stage === "hello") {
+		if (msg.type !== "hello") return fail(`first message was "${msg.type}", not "hello"`);
+		anxiety = msg.anxiety;
+		if (!anxiety || !["calm", "elevated", "frantic", "meltdown"].includes(anxiety.level) || typeof anxiety.perMinute !== "number") return fail("hello.anxiety is missing or malformed");
+		stage = "checkfeed";
+		try { await (await fetch(`${base}/`, { headers: { "user-agent": ua, accept: "text/html" } })).arrayBuffer(); } catch (err) { fail(`GET / failed: ${err}`); }
+		return;
+	}
+	if (stage === "checkfeed" && msg.type === "checkfeed") {
+		const ok = Array.isArray(msg.items) && msg.items.length > 0 && msg.items.every((i) => /^([A-Z]{2}|T1)$/.test(i.country) && Number.isInteger(i.n) && i.n > 0);
+		if (!ok) return fail(`malformed checkfeed: ${JSON.stringify(msg).slice(0, 120)}`);
+		stage = "done";
+		clearTimeout(timer);
+		console.log(`anxiety ${anxiety.level}; checkfeed ${msg.items.map((i) => `${i.n}×${i.country}`).join(", ")}`);
+		ws.close();
+		setTimeout(() => process.exit(0), 50);
+	}
+});
+'
+
+begin "WebSocket hello carries the anxiety meter, and a check shows up in the check feed"
+if out=$(node -e "$SOCIAL_WS_SCRIPT" "$WS_BASE/ws" "$BASE" "$BROWSER_UA" 2>&1); then
+	CHECK="$CHECK ($out)"
+else
+	problem "$out"
+fi
+finish
 
 begin "SSE /api/stream sends hello first"
 # The stream never ends, so curl stops it (28); a server that rotates or restarts the stream

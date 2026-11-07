@@ -80,15 +80,29 @@ export interface DeliveryResult {
 
 export type Channel = 'email' | 'push' | 'webhook' | 'dns' | 'og';
 
+/** The global anxiety meter: checks per minute over the last five minutes (social). */
+export type AnxietyLevel = 'calm' | 'elevated' | 'frantic' | 'meltdown';
+
+export interface AnxietyReading {
+	level: AnxietyLevel;
+	/** Checks per minute, averaged over the last five minutes, to one decimal place. */
+	perMinute: number;
+}
+
 /** Server → browser messages over the live WebSocket / SSE stream. */
 export type LiveMessage =
-	| { type: 'hello'; state: SiteState; viewers: number; vibes: number; checks: number; reloadNonce: string }
+	| { type: 'hello'; state: SiteState; viewers: number; vibes: number; checks: number; reloadNonce: string; anxiety?: AnxietyReading }
 	| { type: 'state'; state: SiteState }
 	| { type: 'update'; update: Update }
 	| { type: 'viewers'; viewers: number }
-	| { type: 'vibes'; vibes: number; emoji: string }
+	/** `country`: the sender's ISO 3166-1 alpha-2 code (or 'T1'), when known. */
+	| { type: 'vibes'; vibes: number; emoji: string; country?: string }
 	| { type: 'checks'; checks: number }
-	| { type: 'reload'; nonce: string };
+	| { type: 'reload'; nonce: string }
+	// Social: who just checked (by country, at most every 3 s), round-number checks, the anxiety meter.
+	| { type: 'checkfeed'; items: Array<{ country: string; n: number }>; more?: number }
+	| { type: 'milestone'; n: number; country: string }
+	| ({ type: 'anxiety' } & AnxietyReading);
 
 /** Browser → server messages over the live WebSocket. */
 export type ClientMessage = { type: 'vibe'; emoji?: string } | { type: 'ping' };

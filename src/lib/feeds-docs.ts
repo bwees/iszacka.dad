@@ -255,6 +255,7 @@ ${section(
 		{ method: 'GET', path: '/ws', what: 'WebSocket: the same live messages as /api/stream, plus vibes you can send.' },
 		{ method: 'GET', path: '/api/live', what: 'Live numbers, the current state and the reload nonce, as JSON. For clients that poll instead of holding a WebSocket.' },
 		{ method: 'GET', path: '/stats', what: 'Anxiety analytics: who checks, when, and from where (aggregated).' },
+		{ method: 'GET', path: '/api/countries', what: 'All-time checks per country (country only), for the live map. Cached for a minute; CORS open.' },
 		{ method: 'GET', path: '/api/ledger', what: 'The Dad Ledger: a hash-chained, Ed25519-signed log of status changes.' },
 		{ method: 'GET', path: '/.well-known/dad-ledger.json', what: 'The ledger and its public key, for independent verification.' },
 		{ method: 'GET', path: '/og.png', what: 'The social preview image for the current status (pre-rendered).' },
