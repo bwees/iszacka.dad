@@ -123,7 +123,9 @@ jobs:
         env:
           ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          DNS_API_TOKEN: ${{ secrets.DNS_API_TOKEN }}
+          # The deploy token has DNS Edit on the zone, so it doubles as the Worker's DNS token
+          # unless a narrower DNS_API_TOKEN secret is set (which then takes precedence).
+          DNS_API_TOKEN: ${{ secrets.DNS_API_TOKEN || secrets.CLOUDFLARE_API_TOKEN }}
           DNS_ZONE_ID: ${{ secrets.DNS_ZONE_ID }}
           TURNSTILE_SITE_KEY: ${{ secrets.TURNSTILE_SITE_KEY }}
           TURNSTILE_SECRET_KEY: ${{ secrets.TURNSTILE_SECRET_KEY }}
