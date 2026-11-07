@@ -347,6 +347,74 @@ export interface WebhookSendResult extends DeliveryResult {
 	disabled?: boolean;
 }
 
+/** What a POST came to: the HTTP status (0 for no response) and a human-readable detail. */
+interface Posted {
+	status: number;
+	detail: string;
+}
+
+/** POST one message (no redirects, with a timeout). Never throws. */
+async function postWebhook(hook: Pick<WebhookRow, 'url'>, request: WebhookRequest): Promise<Posted> {
+	try {
+		const res = await fetch(hook.url, {
+			method: 'POST',
+			headers: request.headers,
+			body: request.body,
+			redirect: 'manual',
+			signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
+		});
+		return { status: res.status, detail: await describeResponse(res) };
+	} catch (err) {
+		return { status: 0, detail: describeError(err) };
+	}
+}
+
+type Verdict = 'ok' | 'gone' | 'fail';
+
+function verdictFor(status: number): Verdict {
+	if (status >= 200 && status < 300) return 'ok';
+	if (status === 404 || status === 410) return 'gone';
+	return 'fail';
+}
+
+/** The bookkeeping UPDATE for one POST. 'fail' RETURNs the new failure count and disabled_at. */
+function bookkeepingStatement(env: Env, hookId: number, verdict: Verdict, status: number, sentAt: string): D1PreparedStatement {
+	if (verdict === 'ok') {
+		return env.DB.prepare('UPDATE webhooks SET failures = 0, last_status = ?, last_sent_at = ?, disabled_at = NULL WHERE id = ?').bind(
+			status,
+			sentAt,
+			hookId,
+		);
+	}
+	if (verdict === 'gone') {
+		return env.DB.prepare(
+			'UPDATE webhooks SET failures = failures + 1, last_status = ?, last_sent_at = ?, disabled_at = COALESCE(disabled_at, ?) WHERE id = ?',
+		).bind(status, sentAt, sentAt, hookId);
+	}
+	return env.DB.prepare(
+		`UPDATE webhooks SET failures = failures + 1, last_status = ?, last_sent_at = ?,
+		 disabled_at = CASE WHEN failures + 1 >= ? THEN COALESCE(disabled_at, ?) ELSE disabled_at END
+		 WHERE id = ? RETURNING failures, disabled_at`,
+	).bind(status, sentAt, MAX_WEBHOOK_FAILURES, sentAt, hookId);
+}
+
+/** The result for one POST, given its verdict and (for failures) the row the bookkeeping returned. */
+function sendResult(
+	verdict: Verdict,
+	posted: Posted,
+	account: boolean,
+	row: { failures: number; disabled_at: string | null } | null,
+): WebhookSendResult {
+	const { status, detail } = posted;
+	if (verdict === 'ok') return { ok: true, status, detail };
+	if (verdict === 'gone') return { ok: false, gone: true, disabled: account, status, detail: `${detail}: the webhook is gone, so it's been disabled` };
+	if (!account) return { ok: false, status, detail };
+	if (row && row.failures >= MAX_WEBHOOK_FAILURES) {
+		return { ok: false, status, disabled: true, detail: `${detail} (failure ${row.failures}; disabled after ${MAX_WEBHOOK_FAILURES} in a row)` };
+	}
+	return { ok: false, status, detail: row ? `${detail} (failure ${row.failures} of ${MAX_WEBHOOK_FAILURES})` : detail };
+}
+
 /**
  * POST one message and keep the books (failures, last status, disabling). Never
  * throws. `account: false` skips the bookkeeping (used for the goodbye message,
@@ -362,57 +430,85 @@ export async function sendWebhook(
 	const event = opts.event ?? 'update';
 	const account = opts.account ?? true;
 	const sentAt = nowIso();
-	let status = 0;
-	let detail: string;
+	let posted: Posted;
 	try {
-		const request = await buildWebhookRequest(hook, update, state, siteUrl(env), event, sentAt);
-		const res = await fetch(hook.url, {
-			method: 'POST',
-			headers: request.headers,
-			body: request.body,
-			redirect: 'manual',
-			signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
-		});
-		status = res.status;
-		detail = await describeResponse(res);
+		posted = await postWebhook(hook, await buildWebhookRequest(hook, update, state, siteUrl(env), event, sentAt));
 	} catch (err) {
-		detail = describeError(err);
+		posted = { status: 0, detail: describeError(err) };
 	}
-
-	if (status >= 200 && status < 300) {
-		if (account) await bookkeep(env, 'UPDATE webhooks SET failures = 0, last_status = ?, last_sent_at = ?, disabled_at = NULL WHERE id = ?', [status, sentAt, hook.id]);
-		return { ok: true, status, detail };
-	}
-
-	if (status === 404 || status === 410) {
-		if (account) {
-			await bookkeep(
-				env,
-				'UPDATE webhooks SET failures = failures + 1, last_status = ?, last_sent_at = ?, disabled_at = COALESCE(disabled_at, ?) WHERE id = ?',
-				[status, sentAt, sentAt, hook.id],
-			);
+	const verdict = verdictFor(posted.status);
+	let row: { failures: number; disabled_at: string | null } | null = null;
+	if (account) {
+		try {
+			row = await bookkeepingStatement(env, hook.id, verdict, posted.status, sentAt).first<{ failures: number; disabled_at: string | null }>();
+		} catch (err) {
+			console.error('webhook bookkeeping failed:', err);
 		}
-		return { ok: false, gone: true, disabled: account, status, detail: `${detail}: the webhook is gone, so it's been disabled` };
 	}
-
-	if (!account) return { ok: false, status, detail };
-	const row = await bookkeep<{ failures: number; disabled_at: string | null }>(
-		env,
-		`UPDATE webhooks SET failures = failures + 1, last_status = ?, last_sent_at = ?,
-		 disabled_at = CASE WHEN failures + 1 >= ? THEN COALESCE(disabled_at, ?) ELSE disabled_at END
-		 WHERE id = ? RETURNING failures, disabled_at`,
-		[status, sentAt, MAX_WEBHOOK_FAILURES, sentAt, hook.id],
-	);
-	if (row && row.failures >= MAX_WEBHOOK_FAILURES) {
-		return { ok: false, status, disabled: true, detail: `${detail} (failure ${row.failures}; disabled after ${MAX_WEBHOOK_FAILURES} in a row)` };
-	}
-	return { ok: false, status, detail: row ? `${detail} (failure ${row.failures} of ${MAX_WEBHOOK_FAILURES})` : detail };
+	return sendResult(verdict, posted, account, row);
 }
 
 /** POST one webhook. Never throws; disables hooks that are gone or keep failing. */
 export async function deliverWebhook(env: Env, hook: WebhookRow, update: Update, state: SiteState): Promise<DeliveryResult> {
-	const { ok, gone, detail } = await sendWebhook(env, hook, update, state, { event: 'update' });
-	return gone ? { ok, gone, detail } : { ok, detail };
+	const [result] = await deliverWebhookBatch(env, [hook], update, state);
+	return result ?? { ok: false, detail: 'unexpected error: no result' };
+}
+
+/** Simultaneous POSTs per batch: Workers allows six open connections per invocation. */
+const WEBHOOK_CONCURRENCY = 6;
+
+/**
+ * POST an update to a batch of hooks (at most WEBHOOK_CONCURRENCY at a time), then keep the
+ * books for all of them in one D1 batch. Discord and Slack bodies are the same for every hook,
+ * so each is built once. Never throws; one result per hook, in order.
+ */
+export async function deliverWebhookBatch(
+	env: Env,
+	hooks: readonly WebhookRow[],
+	update: Update,
+	state: SiteState,
+): Promise<DeliveryResult[]> {
+	const base = siteUrl(env);
+	const sentAt = nowIso();
+	const shared = new Map<WebhookKind, Promise<WebhookRequest>>();
+	const requestFor = (hook: WebhookRow): Promise<WebhookRequest> => {
+		if (hook.kind === 'generic') return buildWebhookRequest(hook, update, state, base, 'update', sentAt);
+		let request = shared.get(hook.kind);
+		if (!request) shared.set(hook.kind, (request = buildWebhookRequest(hook, update, state, base, 'update', sentAt)));
+		return request;
+	};
+
+	const posted: Posted[] = new Array(hooks.length);
+	let next = 0;
+	const worker = async () => {
+		while (next < hooks.length) {
+			const i = next++;
+			const hook = hooks[i] as WebhookRow;
+			try {
+				posted[i] = await postWebhook(hook, await requestFor(hook));
+			} catch (err) {
+				posted[i] = { status: 0, detail: describeError(err) };
+			}
+		}
+	};
+	await Promise.all(Array.from({ length: Math.min(WEBHOOK_CONCURRENCY, hooks.length) }, worker));
+
+	const verdicts = posted.map((p) => verdictFor(p.status));
+	let rows: Array<{ failures: number; disabled_at: string | null } | null> = hooks.map(() => null);
+	if (hooks.length) {
+		try {
+			const written = await env.DB.batch<{ failures: number; disabled_at: string | null }>(
+				hooks.map((hook, i) => bookkeepingStatement(env, hook.id, verdicts[i] as Verdict, (posted[i] as Posted).status, sentAt)),
+			);
+			rows = written.map((r) => r?.results[0] ?? null);
+		} catch (err) {
+			console.error('webhook bookkeeping failed:', err);
+		}
+	}
+	return hooks.map((_, i) => {
+		const { ok, gone, detail } = sendResult(verdicts[i] as Verdict, posted[i] as Posted, true, rows[i] ?? null);
+		return gone ? { ok, gone, detail } : { ok, detail };
+	});
 }
 
 async function describeResponse(res: Response): Promise<string> {
@@ -467,15 +563,4 @@ function describeError(err: unknown): string {
 		return `no response within ${WEBHOOK_TIMEOUT_MS / 1000}s`;
 	}
 	return `request failed: ${err instanceof Error ? err.message : String(err)}`.slice(0, 200);
-}
-
-async function bookkeep<T = Record<string, unknown>>(env: Env, sql: string, binds: unknown[]): Promise<T | null> {
-	try {
-		return await env.DB.prepare(sql)
-			.bind(...binds)
-			.first<T>();
-	} catch (err) {
-		console.error('webhook bookkeeping failed:', err);
-		return null;
-	}
 }

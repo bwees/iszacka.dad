@@ -11,7 +11,7 @@ import type { Audience, DeliveryResult, Frequency, SiteState, Status, Subscriber
 import { UNCONFIRMED_TTL_DAYS } from '../lib/retention';
 import { DOMAIN, SITE_NAME, STATUS_COPY, siteUrl } from '../lib/site';
 import { sha256Hex } from '../lib/security';
-import { daysBetween, formatLondon, formatLondonDate, nowIso } from '../lib/time';
+import { daysBetween, formatLondon, formatLondonDate, formatNumber, nowIso } from '../lib/time';
 
 type Html = HtmlEscapedString | Promise<HtmlEscapedString>;
 
@@ -329,7 +329,7 @@ export async function renderUpdateEmail(input: UpdateEmailInput): Promise<Render
 		const note = adminNote(update);
 		const lines = [
 			'After months of answering "no" with industrial-grade reliability, iszacka.dad can finally, officially and cryptographically confirm it: Zack is a dad. The baby is here.',
-			'This email was fanned out by a durable workflow with exponential backoff, after a 60-second undo window, while the news was written to a hash-chained, Ed25519-signed ledger, published to DNS, pushed down WebSockets to every open browser and photographed by a headless browser for the social card. For one baby. Worth it.',
+			'This email was fanned out by a durable workflow with exponential backoff, after a 60-second undo window, while the news was written to a hash-chained, Ed25519-signed ledger, published to DNS and pushed down WebSockets to every open browser, in steps of under ten milliseconds of CPU each. For one baby. Worth it.',
 		];
 		const after =
 			"What now? Nothing is required of you. Please don't ring: Jess and Zack are busy and will surface in due course. Congratulations are very welcome on the wall.";
@@ -441,6 +441,38 @@ ${dailyNote ? paragraphs(dailyNote, SMALL) : ''}`,
 	};
 }
 
+/**
+ * Stands in for the subscriber token while an update email is rendered once per frequency.
+ * Letters and digits only, so URL-encoding and HTML-escaping leave it exactly as it is.
+ */
+const TOKEN_SLOT = 'izadTokenSlot7f3a9c2e';
+
+const HTML_ESCAPES: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+const escapeHtml = (value: string) => value.replace(/[&<>"']/g, (c) => HTML_ESCAPES[c] as string);
+
+/**
+ * Renders an update email for many subscribers: the template is rendered once per frequency,
+ * then each subscriber's token is put into the links (encoded exactly as subscriberUrls and the
+ * template's escaping would have). The result is identical to renderUpdateEmail per subscriber.
+ */
+export function updateEmailRenderer(base: string, update: Update): (sub: Pick<SubscriberRow, 'token' | 'frequency'>) => Promise<RenderedEmail> {
+	// If the slot could collide with real content, fall back to rendering each email in full.
+	if ([base, update.title, update.body].some((v) => v.includes(TOKEN_SLOT))) {
+		return (sub) => renderUpdateEmail({ base, update, token: sub.token, frequency: sub.frequency });
+	}
+	const templates = new Map<Frequency, Promise<RenderedEmail>>();
+	return async (sub) => {
+		let template = templates.get(sub.frequency);
+		if (!template) {
+			template = renderUpdateEmail({ base, update, token: TOKEN_SLOT, frequency: sub.frequency });
+			templates.set(sub.frequency, template);
+		}
+		const { subject, html: body, text: plain } = await template;
+		const encoded = encodeURIComponent(sub.token);
+		return { subject, html: body.replaceAll(TOKEN_SLOT, escapeHtml(encoded)), text: plain.replaceAll(TOKEN_SLOT, encoded) };
+	};
+}
+
 // ─── Templates: inbound auto-replies ─────────────────────────────────────────
 
 /** "Re: <their subject>" without stacking Re:s or carrying header-breaking characters. */
@@ -468,7 +500,8 @@ export interface AutoReplyInput {
 	dnsName?: string | null;
 }
 
-const fmt = (n: number) => new Intl.NumberFormat('en-GB').format(n);
+/** Thousands separators without ICU's per-isolate start-up cost (see lib/time.ts). */
+const fmt = (n: number) => formatNumber(n);
 
 function dueFact(dueDate: string, today: string): string {
 	const d = daysBetween(today, dueDate);
@@ -782,14 +815,16 @@ export async function emailQuotaRemaining(env: Pick<Env, 'DB' | 'EMAIL_DAILY_LIM
 }
 
 /**
- * Count one email against today's quota: every successful send, and (Resend counts these too)
- * every received email. Never throws.
+ * Count emails against today's quota: every successful send, and (Resend counts these too)
+ * every received email. `count` lets a batch record all its sends in one write. Never throws.
  */
-export async function recordEmailSend(env: Pick<Env, 'DB'>, now: Date = new Date()): Promise<void> {
+export async function recordEmailSend(env: Pick<Env, 'DB'>, now: Date = new Date(), count = 1): Promise<void> {
+	const n = Math.trunc(count);
+	if (!(n > 0)) return;
 	try {
 		if (!env.DB) return;
-		await env.DB.prepare('INSERT INTO email_sends (day, n) VALUES (?, 1) ON CONFLICT(day) DO UPDATE SET n = n + 1')
-			.bind(utcDay(now))
+		await env.DB.prepare('INSERT INTO email_sends (day, n) VALUES (?1, ?2) ON CONFLICT(day) DO UPDATE SET n = n + ?2')
+			.bind(utcDay(now), n)
 			.run();
 	} catch (err) {
 		console.error('email: could not count the send:', errorMessage(err));
@@ -806,6 +841,28 @@ export type SendEmailEnv = Pick<
 function formatFrom(from: { email: string; name?: string }): string {
 	const name = cleanHeaderValue(from.name ?? '', 200).replace(/["<>]/g, ' ').replace(/\s+/g, ' ').trim();
 	return name ? `"${name}" <${from.email}>` : from.email;
+}
+
+/** One email in the shape Resend's /emails and /emails/batch take. */
+function resendEmailBody(env: SendEmailEnv, msg: OutgoingEmail) {
+	const headers: Record<string, string> = {};
+	for (const [name, value] of Object.entries(msg.headers ?? {})) {
+		const clean = cleanHeaderValue(value);
+		if (clean) headers[name] = clean;
+	}
+	return {
+		from: formatFrom(msg.from ?? { email: env.EMAIL_FROM, name: env.EMAIL_FROM_NAME }),
+		to: msg.to,
+		subject: cleanHeaderValue(msg.subject, 300) || SITE_NAME,
+		html: msg.html,
+		text: msg.text,
+		...(msg.replyTo ? { reply_to: msg.replyTo } : {}),
+		...(Object.keys(headers).length ? { headers } : {}),
+	};
+}
+
+function resendBase(env: SendEmailEnv): string {
+	return (env.RESEND_API_BASE || RESEND_API_BASE).replace(/\/+$/, '');
 }
 
 /** Resend's Idempotency-Key: the caller's per-send key, hashed, or a random one. */
@@ -856,22 +913,7 @@ export async function sendEmail(env: SendEmailEnv, msg: OutgoingEmail, opts: Sen
 		};
 	}
 
-	const headers: Record<string, string> = {};
-	for (const [name, value] of Object.entries(msg.headers ?? {})) {
-		const clean = cleanHeaderValue(value);
-		if (clean) headers[name] = clean;
-	}
-	const subject = cleanHeaderValue(msg.subject, 300) || SITE_NAME;
-	const body = {
-		from: formatFrom(msg.from ?? { email: env.EMAIL_FROM, name: env.EMAIL_FROM_NAME }),
-		to: msg.to,
-		subject,
-		html: msg.html,
-		text: msg.text,
-		...(msg.replyTo ? { reply_to: msg.replyTo } : {}),
-		...(Object.keys(headers).length ? { headers } : {}),
-	};
-	const base = (env.RESEND_API_BASE || RESEND_API_BASE).replace(/\/+$/, '');
+	const base = resendBase(env);
 	const request: RequestInit = {
 		method: 'POST',
 		headers: {
@@ -880,7 +922,7 @@ export async function sendEmail(env: SendEmailEnv, msg: OutgoingEmail, opts: Sen
 			'User-Agent': RESEND_USER_AGENT,
 			'Idempotency-Key': await idempotencyKey(msg),
 		},
-		body: JSON.stringify(body),
+		body: JSON.stringify(resendEmailBody(env, msg)),
 	};
 	const call = opts.fetch ?? fetch;
 	const sleep = opts.sleep ?? defaultSleep;
@@ -908,6 +950,184 @@ export async function sendEmail(env: SendEmailEnv, msg: OutgoingEmail, opts: Sen
 		const detail = `${e.code}: ${cleanHeaderValue(e.message, 300)}`;
 		if (e.kind !== 'transient') console.warn(`email send failed permanently: ${e.code}`);
 		return { ok: false, gone: e.kind === 'suppressed' ? true : undefined, transient: e.kind === 'transient', code: e.code, detail };
+	}
+}
+
+/** Resend's batch endpoint takes at most this many emails per request. */
+export const RESEND_BATCH_LIMIT = 100;
+
+export interface BatchSendOptions extends SendOptions {
+	/**
+	 * Identifies the logical batch (for example the update). Combined with each email's own
+	 * idempotencyKey (or address) into the request's Idempotency-Key, so a retry of exactly the
+	 * same emails is deduplicated by Resend and a different set gets a fresh key.
+	 */
+	idempotencyKey?: string;
+}
+
+function quotaRefusal(remaining: number, reserve: number, limit: number): EmailDelivery {
+	return remaining > 0 && reserve > 0
+		? {
+				ok: false,
+				transient: true,
+				code: 'quota_reserve',
+				detail: `quota_reserve: only ${remaining} emails left today, and the last ${reserve} are kept for real news`,
+			}
+		: {
+				ok: false,
+				transient: true,
+				code: 'daily_quota_exceeded',
+				detail: `daily_quota_exceeded: EMAIL_DAILY_LIMIT (${limit}) reached for today; the quota resets at midnight UTC`,
+			};
+}
+
+/** A per-email error from a permissive batch: { index, message }, with the error name in the message if at all. */
+function batchItemFailure(message: string): EmailDelivery {
+	const e = classifyEmailError(new ResendApiError(422, /\b[a-z]+(?:_[a-z0-9]+)+\b/.exec(message)?.[0] ?? 'validation_error', message));
+	return {
+		ok: false,
+		gone: e.kind === 'suppressed' ? true : undefined,
+		transient: e.kind === 'transient',
+		code: e.code,
+		detail: `${e.code}: ${cleanHeaderValue(e.message, 300)}`,
+	};
+}
+
+/**
+ * Send many emails with one request to Resend's batch endpoint (POST /emails/batch). Never
+ * throws; returns one EmailDelivery per message, in order.
+ *
+ * Reads today's quota once and sends only what it allows (the rest come back with a quota
+ * code, unsent), and counts every success in `email_sends` with one write. Uses permissive
+ * validation, so one bad address fails alone instead of sinking the batch. A failure of the
+ * whole request (rate limit, outage) is retried once in-process with the same Idempotency-Key.
+ */
+export async function sendEmailBatch(env: SendEmailEnv, msgs: readonly OutgoingEmail[], opts: BatchSendOptions = {}): Promise<EmailDelivery[]> {
+	if (msgs.length === 0) return [];
+	if (!env.RESEND_API_KEY) {
+		return msgs.map(() => ({ ok: false, transient: false, code: 'no_api_key', detail: "no_api_key: RESEND_API_KEY isn't set on the Worker" }));
+	}
+	if (msgs.length > RESEND_BATCH_LIMIT) {
+		const out: EmailDelivery[] = [];
+		for (let i = 0; i < msgs.length; i += RESEND_BATCH_LIMIT) out.push(...(await sendEmailBatch(env, msgs.slice(i, i + RESEND_BATCH_LIMIT), opts)));
+		return out;
+	}
+
+	const remaining = await emailQuotaRemaining(env);
+	const reserve = Math.max(0, opts.reserve ?? 0);
+	const allowed = Math.min(msgs.length, Math.max(0, remaining - reserve));
+	const results: EmailDelivery[] = msgs.map(() => quotaRefusal(remaining, reserve, emailDailyLimit(env)));
+	if (allowed === 0) return results;
+	const batch = msgs.slice(0, allowed);
+
+	const key = await sha256Hex(
+		`batch\n${opts.idempotencyKey ?? crypto.randomUUID()}\n${batch.map((m) => m.idempotencyKey ?? m.to).join('\n')}`,
+	);
+	const request: RequestInit = {
+		method: 'POST',
+		headers: {
+			Authorization: `Bearer ${env.RESEND_API_KEY}`,
+			'Content-Type': 'application/json',
+			'User-Agent': RESEND_USER_AGENT,
+			'Idempotency-Key': key,
+			'x-batch-validation': 'permissive',
+		},
+		body: JSON.stringify(batch.map((m) => resendEmailBody(env, m))),
+	};
+	const call = opts.fetch ?? fetch;
+	const sleep = opts.sleep ?? defaultSleep;
+	const baseDelay = opts.retryDelayMs ?? 750;
+
+	for (let attempt = 1; ; attempt++) {
+		let failure: unknown = null;
+		try {
+			const res = await call(`${resendBase(env)}/emails/batch`, request);
+			if (res.ok) {
+				const data = (await res.json().catch(() => null)) as { data?: unknown; errors?: unknown } | null;
+				const failed = new Map<number, string>();
+				for (const e of Array.isArray(data?.errors) ? data.errors : []) {
+					const { index, message } = (e ?? {}) as { index?: unknown; message?: unknown };
+					if (typeof index === 'number' && Number.isInteger(index) && index >= 0 && index < batch.length) {
+						failed.set(index, typeof message === 'string' && message ? message : 'rejected by Resend');
+					}
+				}
+				// `data` lists the created emails in request order, skipping the rejected ones.
+				const ids = (Array.isArray(data?.data) ? data.data : []).map((d) => {
+					const id = (d as { id?: unknown } | null)?.id;
+					return typeof id === 'string' ? id : undefined;
+				});
+				const pairIds = ids.length === batch.length - failed.size;
+				let n = 0;
+				for (let i = 0; i < batch.length; i++) {
+					const message = failed.get(i);
+					if (message !== undefined) {
+						results[i] = batchItemFailure(message);
+						continue;
+					}
+					const messageId = pairIds ? ids[n] : undefined;
+					n++;
+					results[i] = { ok: true, messageId, detail: messageId ? `sent ${messageId}` : 'sent' };
+				}
+				await recordEmailSend(env, new Date(), batch.length - failed.size);
+				return results;
+			}
+			failure = await resendError(res);
+		} catch (err) {
+			failure = err; // network-level failure: transient
+		}
+		const e = classifyEmailError(failure);
+		if (e.retryNow && attempt === 1 && !isQuotaCode(e.code)) {
+			await sleep(Math.round(baseDelay * (1 + Math.random() * 0.5)));
+			continue;
+		}
+		const detail = `${e.code}: ${cleanHeaderValue(e.message, 300)}`;
+		if (e.kind !== 'transient') console.warn(`email batch failed permanently: ${e.code}`);
+		const outcome: EmailDelivery = { ok: false, gone: e.kind === 'suppressed' ? true : undefined, transient: e.kind === 'transient', code: e.code, detail };
+		for (let i = 0; i < batch.length; i++) results[i] = { ...outcome };
+		return results;
+	}
+}
+
+/**
+ * Email one update to a batch of subscribers with a single Resend request (see sendEmailBatch).
+ * Templates are rendered once per frequency. Suppressed addresses are unsubscribed. Never
+ * throws; one result per subscriber, in order.
+ */
+export async function deliverEmailBatch(env: Env, subs: readonly SubscriberRow[], update: Update, opts: SendOptions = {}): Promise<EmailDelivery[]> {
+	try {
+		const base = siteUrl(env);
+		const render = updateEmailRenderer(base, update);
+		const msgs: OutgoingEmail[] = [];
+		for (const sub of subs) {
+			msgs.push({
+				to: sub.email,
+				...(await render(sub)),
+				headers: subscriberHeaders(base, sub.token, update.status, update.id),
+				// Stable across workflow step retries and re-runs: one update, one subscriber.
+				idempotencyKey: `update:${update.id}:${sub.id}`,
+			});
+		}
+		const results = await sendEmailBatch(env, msgs, { ...opts, idempotencyKey: `update:${update.id}` });
+		const gone = subs.filter((_, i) => results[i]?.gone);
+		if (gone.length) {
+			await disableSubscribers(
+				env,
+				gone.map((s) => s.id),
+			);
+		}
+		return results.map((r) => (r.gone ? { ...r, detail: `${r.detail ?? ''} (subscriber disabled)`.trim() } : r));
+	} catch (err) {
+		return subs.map(() => ({ ok: false, transient: true, code: 'unknown_error', detail: `unknown_error: ${errorMessage(err)}` }));
+	}
+}
+
+/** Stop emailing several subscribers (suppressed addresses), in one D1 round trip. Never throws. */
+async function disableSubscribers(env: Env, ids: readonly number[]): Promise<void> {
+	try {
+		const at = nowIso();
+		await env.DB.batch(ids.map((id) => env.DB.prepare('UPDATE subscribers SET unsubscribed_at = COALESCE(unsubscribed_at, ?) WHERE id = ?').bind(at, id)));
+	} catch (err) {
+		console.error('could not disable subscribers:', errorMessage(err));
 	}
 }
 

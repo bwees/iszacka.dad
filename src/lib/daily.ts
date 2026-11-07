@@ -3,11 +3,11 @@
 // by day number), due/overdue context and the check counter. After YES: seven "dad day" posts,
 // then a final "daily service concluded" post, then silence.
 //
-// Everything here is pure (no I/O) so the cron, the tests and anyone curious can reason about
+// Everything here is pure (no I/O) so the daily workflow, the tests and anyone curious can reason about
 // exactly what goes out on any given day.
 
 import type { SiteState, Status } from '../types';
-import { daysBetween, formatLondonDate, isYmd, londonDate } from './time';
+import { daysBetween, formatLondonDate, formatNumber, isYmd, londonDate } from './time';
 
 /**
  * ~30 dry one-liners for the "still no" phase. Copy rules: no gendered pronouns for anyone,
@@ -118,7 +118,8 @@ export function dueContext(dueDate: string | null, today: string): string {
 /** "The answer has been checked 12,345 times. It has not budged." */
 export function checksContext(checks: number | null | undefined): string | null {
 	if (typeof checks !== 'number' || !Number.isFinite(checks) || checks <= 0) return null;
-	const formatted = new Intl.NumberFormat('en-GB').format(Math.trunc(checks));
+	// formatNumber groups whole numbers by hand: no ICU start-up cost in the daily step.
+	const formatted = formatNumber(Math.trunc(checks));
 	return checks === 1
 		? 'The answer has been checked exactly once. It did not budge.'
 		: `The answer has been checked ${formatted} times. It has not budged.`;

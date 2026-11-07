@@ -1,4 +1,4 @@
-// Test doubles shared by the push agent's tests: a D1 stand-in that records SQL,
+// Test doubles shared by the push / notify tests: a D1 stand-in that records SQL,
 // a settings store for getOrCreateSetting, and a scripted fetch.
 
 import type { SiteState, Update } from '../src/types';
@@ -6,19 +6,34 @@ import type { SiteState, Update } from '../src/types';
 export interface RecordedQuery {
 	sql: string;
 	binds: unknown[];
-	method: 'first' | 'all' | 'run';
+	method: 'first' | 'all' | 'run' | 'batch';
 }
 
-/** Answers queries with whatever `respond` returns, and keeps a log of them. */
+/**
+ * Answers queries with whatever `respond` returns, and keeps a log of them. Statements inside
+ * db.batch() are logged one by one with method 'batch' (and `batches` counts the round trips);
+ * each gets `{ results: [respond(q)] }` (or the array respond returns).
+ */
 export function fakeDb(respond: (q: RecordedQuery) => unknown = () => null) {
 	const queries: RecordedQuery[] = [];
+	const counts = { batches: 0 };
 	const db = {
+		async batch(statements: Array<{ __batch(): unknown }>) {
+			counts.batches++;
+			return statements.map((s) => s.__batch());
+		},
 		prepare(sql: string) {
 			let binds: unknown[] = [];
 			const statement = {
 				bind(...args: unknown[]) {
 					binds = args;
 					return statement;
+				},
+				__batch() {
+					const q: RecordedQuery = { sql, binds, method: 'batch' };
+					queries.push(q);
+					const out = respond(q);
+					return { success: true, results: Array.isArray(out) ? out : out == null ? [] : [out], meta: { changes: 1 } };
 				},
 				async first() {
 					const q: RecordedQuery = { sql, binds, method: 'first' };
@@ -39,11 +54,11 @@ export function fakeDb(respond: (q: RecordedQuery) => unknown = () => null) {
 			return statement;
 		},
 	};
-	return { db, queries };
+	return { db, queries, counts };
 }
 
 export function fakeEnv(overrides: Record<string, unknown> = {}, respond?: (q: RecordedQuery) => unknown) {
-	const { db, queries } = fakeDb(respond);
+	const { db, queries, counts } = fakeDb(respond);
 	const env = {
 		DB: db,
 		SITE_URL: 'https://iszacka.dad',
@@ -51,7 +66,7 @@ export function fakeEnv(overrides: Record<string, unknown> = {}, respond?: (q: R
 		ZONE_NAME: 'iszacka.dad',
 		...overrides,
 	} as unknown as Env;
-	return { env, queries };
+	return { env, queries, counts };
 }
 
 export interface FetchCall {

@@ -7,7 +7,8 @@
 //   404/410   the subscription is gone; disabled immediately
 //   429/5xx   retried once, then a failure
 //   other     a failure
-// Five consecutive failures disable a subscription.
+// Five consecutive failures disable a subscription. The announce workflow sends a
+// batch per step (deliverPushBatch) and keeps all the books in one D1 write.
 
 import { nowIso } from '../lib/time';
 import { vapidHeaderForEndpoint } from '../lib/vapid';
@@ -103,7 +104,7 @@ interface Attempt {
 
 async function attemptPush(env: Env, endpoint: string): Promise<Attempt> {
 	try {
-		// A fresh JWT per attempt is cheap, and means a retry never carries a stale one.
+		// One JWT per push service per hour or so (lib/vapid.ts caches it by origin).
 		const authorization = await vapidHeaderForEndpoint(env, endpoint);
 		const res = await fetch(endpoint, {
 			method: 'POST',
@@ -128,48 +129,111 @@ async function attemptPush(env: Env, endpoint: string): Promise<Attempt> {
 	}
 }
 
-/** Send one push. Never throws; disables the subscription when the push service says it's gone. */
-export async function deliverPush(env: Env, sub: PushSubscriptionRow, _update: Update): Promise<DeliveryResult> {
-	try {
-		if (!isHttpsUrl(sub.endpoint)) {
-			await disable(env, sub.id);
-			return { ok: false, gone: true, detail: 'endpoint is not an https URL; disabled' };
-		}
-		// Rows stored before the allowlist, or slipped in some other way, are retired unsent.
-		if (!isPushServiceEndpoint(sub.endpoint)) {
-			await disable(env, sub.id);
-			return { ok: false, gone: true, detail: 'endpoint is not a known push service; disabled' };
-		}
+/** What one push came to, before the bookkeeping. */
+type Sent =
+	| { outcome: 'ok'; detail: string }
+	| { outcome: 'gone'; detail: string }
+	| { outcome: 'fail'; detail: string }
+	/** Never contacted: not an https URL on a known push service. */
+	| { outcome: 'invalid'; detail: string };
 
-		let attempt = await attemptPush(env, sub.endpoint);
-		let outcome = classifyPushStatus(attempt.status);
-		if (outcome === 'retry') {
-			await sleep(retryDelayMs(attempt.retryAfter));
-			attempt = await attemptPush(env, sub.endpoint);
-			outcome = classifyPushStatus(attempt.status);
-			if (outcome === 'retry') outcome = 'fail';
-		}
+async function pushOnce(env: Env, sub: PushSubscriptionRow): Promise<Sent> {
+	if (!isHttpsUrl(sub.endpoint)) return { outcome: 'invalid', detail: 'endpoint is not an https URL; disabled' };
+	// Rows stored before the allowlist, or slipped in some other way, are retired unsent.
+	if (!isPushServiceEndpoint(sub.endpoint)) return { outcome: 'invalid', detail: 'endpoint is not a known push service; disabled' };
 
-		switch (outcome) {
-			case 'ok':
-				await run(env, 'UPDATE push_subscriptions SET failures = 0 WHERE id = ? AND failures != 0', [sub.id]);
-				return { ok: true, detail: attempt.detail };
-			case 'gone':
-				await disable(env, sub.id);
-				return { ok: false, gone: true, detail: `${attempt.detail}: subscription gone, disabled` };
-			default: {
-				const failures = await recordFailure(env, sub.id);
-				if (failures !== null && failures >= MAX_PUSH_FAILURES) {
-					return { ok: false, detail: `${attempt.detail} (failure ${failures}; disabled after ${MAX_PUSH_FAILURES} in a row)` };
-				}
-				return { ok: false, detail: failures === null ? attempt.detail : `${attempt.detail} (failure ${failures} of ${MAX_PUSH_FAILURES})` };
+	let attempt = await attemptPush(env, sub.endpoint);
+	let outcome = classifyPushStatus(attempt.status);
+	if (outcome === 'retry') {
+		await sleep(retryDelayMs(attempt.retryAfter));
+		attempt = await attemptPush(env, sub.endpoint);
+		outcome = classifyPushStatus(attempt.status);
+		if (outcome === 'retry') outcome = 'fail';
+	}
+	return { outcome, detail: attempt.detail } as Sent;
+}
+
+/** Simultaneous pushes per batch: Workers allows six open connections per invocation. */
+const PUSH_CONCURRENCY = 6;
+
+/**
+ * Send one push to each subscription (at most PUSH_CONCURRENCY at a time), then keep the books
+ * for all of them in a single D1 batch: reset failure counts that need it, count failures,
+ * disable the gone. Never throws; one result per subscription, in order.
+ */
+export async function deliverPushBatch(env: Env, subs: readonly PushSubscriptionRow[]): Promise<DeliveryResult[]> {
+	const sent: Sent[] = new Array(subs.length);
+	let next = 0;
+	const worker = async () => {
+		while (next < subs.length) {
+			const i = next++;
+			const sub = subs[i] as PushSubscriptionRow;
+			try {
+				sent[i] = await pushOnce(env, sub);
+			} catch (err) {
+				// Belt and braces: nothing above should throw, but a delivery function never does.
+				console.error('push delivery failed unexpectedly:', err);
+				sent[i] = { outcome: 'fail', detail: `unexpected error: ${err instanceof Error ? err.message : String(err)}`.slice(0, 200) };
 			}
 		}
-	} catch (err) {
-		// Belt and braces: nothing above should throw, but a delivery function never does.
-		console.error('push delivery failed unexpectedly:', err);
-		return { ok: false, detail: `unexpected error: ${err instanceof Error ? err.message : String(err)}`.slice(0, 200) };
+	};
+	await Promise.all(Array.from({ length: Math.min(PUSH_CONCURRENCY, subs.length) }, worker));
+
+	// Bookkeeping: one statement per push that changes anything, all in one round trip.
+	const at = nowIso();
+	const statements: D1PreparedStatement[] = [];
+	const failureIndex = new Map<number, number>();
+	sent.forEach((s, i) => {
+		const sub = subs[i] as PushSubscriptionRow;
+		if (s.outcome === 'ok') {
+			// The row carries its count, so a healthy subscription costs no write at all.
+			if (sub.failures !== 0) statements.push(env.DB.prepare('UPDATE push_subscriptions SET failures = 0 WHERE id = ? AND failures != 0').bind(sub.id));
+		} else if (s.outcome === 'gone' || s.outcome === 'invalid') {
+			statements.push(env.DB.prepare('UPDATE push_subscriptions SET disabled_at = COALESCE(disabled_at, ?) WHERE id = ?').bind(at, sub.id));
+		} else {
+			failureIndex.set(i, statements.length);
+			statements.push(
+				env.DB.prepare(
+					`UPDATE push_subscriptions SET failures = failures + 1,
+					 disabled_at = CASE WHEN failures + 1 >= ? THEN COALESCE(disabled_at, ?) ELSE disabled_at END
+					 WHERE id = ? RETURNING failures`,
+				).bind(MAX_PUSH_FAILURES, at, sub.id),
+			);
+		}
+	});
+	let written: D1Result<{ failures: number }>[] | null = null;
+	if (statements.length) {
+		try {
+			written = await env.DB.batch<{ failures: number }>(statements);
+		} catch (err) {
+			console.error('push bookkeeping failed:', err);
+		}
 	}
+
+	return sent.map((s, i): DeliveryResult => {
+		switch (s.outcome) {
+			case 'ok':
+				return { ok: true, detail: s.detail };
+			case 'invalid':
+				return { ok: false, gone: true, detail: s.detail };
+			case 'gone':
+				return { ok: false, gone: true, detail: `${s.detail}: subscription gone, disabled` };
+			default: {
+				const slot = failureIndex.get(i);
+				const failures = written && slot !== undefined ? (written[slot]?.results[0]?.failures ?? null) : null;
+				if (failures !== null && failures >= MAX_PUSH_FAILURES) {
+					return { ok: false, detail: `${s.detail} (failure ${failures}; disabled after ${MAX_PUSH_FAILURES} in a row)` };
+				}
+				return { ok: false, detail: failures === null ? s.detail : `${s.detail} (failure ${failures} of ${MAX_PUSH_FAILURES})` };
+			}
+		}
+	});
+}
+
+/** Send one push. Never throws; disables the subscription when the push service says it's gone. */
+export async function deliverPush(env: Env, sub: PushSubscriptionRow, _update: Update): Promise<DeliveryResult> {
+	const [result] = await deliverPushBatch(env, [sub]);
+	return result ?? { ok: false, detail: 'unexpected error: no result' };
 }
 
 function isHttpsUrl(value: string): boolean {
@@ -182,35 +246,4 @@ function isHttpsUrl(value: string): boolean {
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function disable(env: Env, id: number): Promise<void> {
-	await run(env, 'UPDATE push_subscriptions SET disabled_at = COALESCE(disabled_at, ?) WHERE id = ?', [nowIso(), id]);
-}
-
-/** Count a failure, disabling at the limit. Returns the new count (null if the DB write failed). */
-async function recordFailure(env: Env, id: number): Promise<number | null> {
-	try {
-		const row = await env.DB.prepare(
-			`UPDATE push_subscriptions SET failures = failures + 1,
-			 disabled_at = CASE WHEN failures + 1 >= ? THEN COALESCE(disabled_at, ?) ELSE disabled_at END
-			 WHERE id = ? RETURNING failures`,
-		)
-			.bind(MAX_PUSH_FAILURES, nowIso(), id)
-			.first<{ failures: number }>();
-		return row?.failures ?? null;
-	} catch (err) {
-		console.error('push failure bookkeeping failed:', err);
-		return null;
-	}
-}
-
-async function run(env: Env, sql: string, binds: unknown[]): Promise<void> {
-	try {
-		await env.DB.prepare(sql)
-			.bind(...binds)
-			.run();
-	} catch (err) {
-		console.error('push bookkeeping failed:', err);
-	}
 }

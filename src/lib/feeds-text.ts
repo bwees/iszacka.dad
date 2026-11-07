@@ -5,7 +5,7 @@
 import type { SiteState, Update } from '../types';
 import { escapeXml } from './feeds';
 import { DOMAIN, PARENTS, SITE_NAME, STATUS_COPY } from './site';
-import { daysBetween, formatLondonDate } from './time';
+import { daysBetween, formatLondonDate, formatNumber } from './time';
 
 export const TEXT_CONTENT_TYPE = 'text/plain; charset=utf-8';
 export const XML_CONTENT_TYPE = 'application/xml; charset=utf-8';
@@ -92,7 +92,7 @@ export function renderHumansTxt(input: { state: SiteState; lastUpdated: string; 
 	Responsibilities: Sets the release date. Ignores every roadmap.
 
 /* THANKS */
-	Everyone who keeps refreshing the page (${input.checks.toLocaleString('en-GB')} checks and counting).
+	Everyone who keeps refreshing the page (${formatNumber(input.checks)} checks and counting).
 	Midwives everywhere, in advance.
 	Whoever invented the HTTP 425 status code, for making this possible.
 
@@ -101,8 +101,8 @@ export function renderHumansTxt(input: { state: SiteState; lastUpdated: string; 
 	Language: English (British)
 	Doctype: HTML5
 	Standards: HTML, CSS, RSS 2.0, Atom 1.0, JSON Feed 1.1, iCalendar (RFC 5545), security.txt (RFC 9116), OpenAPI 3.1, Model Context Protocol, HTTP 425 Too Early (RFC 8470), Web Push, Server-Sent Events, WebSockets
-	Components: Hono, qrcode-generator, @cloudflare/puppeteer
-	Software: Cloudflare Workers, D1, Durable Objects, Workflows, Browser Rendering, Resend, an inadvisable amount of TypeScript
+	Components: Hono, qrcode-generator
+	Software: Cloudflare Workers, D1, Durable Objects, Workflows, Resend, an inadvisable amount of TypeScript
 	Brought to you by: ${PARENTS}, ${DOMAIN}
 `;
 }

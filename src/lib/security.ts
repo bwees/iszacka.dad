@@ -40,9 +40,20 @@ export function timingSafeEqual(a: string, b: string): boolean {
 	return diff === 0;
 }
 
+/**
+ * The salt, per database, once read. It is created once and never changes, so each isolate
+ * reads it from D1 at most once instead of on every hash (keyed by the D1 binding, so
+ * tests with separate databases don't share one).
+ */
+const saltCache = new WeakMap<object, string>();
+
 /** Salted hash of an IP (or any identifier). Raw IPs are never stored. */
 export async function hashIdentifier(env: Env, value: string): Promise<string> {
-	const salt = await getOrCreateSetting(env, 'ip_salt', () => randomToken(32));
+	let salt = saltCache.get(env.DB);
+	if (salt === undefined) {
+		salt = await getOrCreateSetting(env, 'ip_salt', () => randomToken(32));
+		saltCache.set(env.DB, salt);
+	}
 	return (await sha256Hex(`${salt}:${value}`)).slice(0, 32);
 }
 

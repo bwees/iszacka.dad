@@ -18,7 +18,7 @@ import { type PublicUpdate, publicUpdate } from './feeds-api';
 import type { ForecastDay } from './forecast';
 import type { BabySize } from './fruit';
 import { SITE_NAME, STATUS_COPY } from './site';
-import { daysBetween, formatLondon, formatLondonDate } from './time';
+import { daysBetween, formatLondon, formatLondonDate, formatNumber } from './time';
 
 // ─── Versions & codes ────────────────────────────────────────────────────────
 
@@ -231,7 +231,7 @@ function pct(probability: number): string {
 }
 
 function plural(n: number, word: string): string {
-	return `${n.toLocaleString('en-GB')} ${word}${n === 1 ? '' : 's'}`;
+	return `${formatNumber(n)} ${word}${n === 1 ? '' : 's'}`;
 }
 
 function dueSummary(state: SiteState, today: string): { summary: string; days: number | null } {

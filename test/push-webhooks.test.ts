@@ -4,6 +4,7 @@ import {
 	buildWebhookRequest,
 	checkPublicHttpsUrl,
 	deliverWebhook,
+	deliverWebhookBatch,
 	detectWebhookKind,
 	discordPayload,
 	genericPayload,
@@ -299,6 +300,54 @@ describe('deliverWebhook', () => {
 		const result = await sendWebhook(env, HOOK, systemUpdate(STATE_NO, 'Bye', 'Bye'), STATE_NO, { event: 'goodbye', account: false });
 		expect(result.ok).toBe(true);
 		expect(queries).toHaveLength(0);
+	});
+});
+
+describe('deliverWebhookBatch', () => {
+	const hooks: WebhookRow[] = [
+		{ ...HOOK, id: 1, kind: 'discord', url: 'https://discord.com/api/webhooks/1/aaa' },
+		{ ...HOOK, id: 2, kind: 'discord', url: 'https://discord.com/api/webhooks/2/bbb' },
+		{ ...HOOK, id: 3, kind: 'generic', url: 'https://example.com/hooks/gone', token: 'tok_one_aaaaaaaaaaaaaaaaaaaa' },
+		{ ...HOOK, id: 4, kind: 'generic', url: 'https://example.com/hooks/down', token: 'tok_two_bbbbbbbbbbbbbbbbbbbb' },
+	];
+
+	it('posts to every hook, then keeps all the books in one D1 round trip', async () => {
+		const { env, queries, counts } = fakeEnv({ SITE_URL: BASE }, (q) =>
+			q.sql.includes('RETURNING failures') ? { failures: 4, disabled_at: null } : null,
+		);
+		const fetch = vi.fn(async (url: string | URL | Request, _init?: RequestInit) => {
+			const href = String(url);
+			if (href.endsWith('/gone')) return new Response('Unknown Webhook', { status: 404 });
+			if (href.endsWith('/down')) return new Response('oops', { status: 500 });
+			return new Response(null, { status: 204 });
+		});
+		vi.stubGlobal('fetch', fetch);
+		const results = await deliverWebhookBatch(env, hooks, UPDATE_YES, STATE_YES);
+
+		expect(results).toEqual([
+			{ ok: true, detail: 'HTTP 204' },
+			{ ok: true, detail: 'HTTP 204' },
+			{ ok: false, gone: true, detail: "HTTP 404: Unknown Webhook: the webhook is gone, so it's been disabled" },
+			{ ok: false, detail: `HTTP 500: oops (failure 4 of ${MAX_WEBHOOK_FAILURES})` },
+		]);
+		expect(counts.batches).toBe(1);
+		expect(queries.map((q) => q.binds.at(-1))).toEqual([1, 2, 3, 4]);
+		expect(queries.every((q) => q.method === 'batch')).toBe(true);
+		// Discord bodies are identical; each generic one is signed with its own token.
+		const bodies = fetch.mock.calls.map((c) => c[1]?.body as string);
+		expect(bodies[0]).toBe(bodies[1]);
+		const signatures = fetch.mock.calls.slice(2).map((c) => (c[1]?.headers as Record<string, string>)['X-Iszackadad-Signature']);
+		expect(signatures[0]).toBe(`sha256=${createHmac('sha256', 'tok_one_aaaaaaaaaaaaaaaaaaaa').update(bodies[2] ?? '').digest('hex')}`);
+		expect(signatures[1]).toBe(`sha256=${createHmac('sha256', 'tok_two_bbbbbbbbbbbbbbbbbbbb').update(bodies[3] ?? '').digest('hex')}`);
+	});
+
+	it('reports every result even when the bookkeeping write fails', async () => {
+		const { env } = fakeEnv({ SITE_URL: BASE });
+		(env.DB as unknown as { batch: () => Promise<never> }).batch = async () => {
+			throw new Error('D1 down');
+		};
+		vi.stubGlobal('fetch', scriptedFetch([new Response('nope', { status: 500 })]).fn);
+		expect(await deliverWebhookBatch(env, [HOOK], UPDATE_YES, STATE_YES)).toEqual([{ ok: false, detail: 'HTTP 500: nope' }]);
 	});
 });
 

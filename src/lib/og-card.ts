@@ -1,11 +1,11 @@
 // OWNER: frontend agent.
 // The 1200×630 social preview card as a fully self-contained HTML document
-// (inline CSS, no external requests) so Browser Rendering can screenshot it via
-// page.setContent(), and scripts can render the static fallbacks in public/og/.
+// (inline CSS, no external requests). scripts/og-render.ts screenshots it into
+// public/og/<status>.png, the only OG images (served by /og.png); /og/card previews it.
 
 import type { SiteState, Status } from '../types';
 import { DOMAIN, PARENTS, STATUS_COPY } from './site';
-import { daysBetween, formatLondon, isYmd } from './time';
+import { daysBetween, formatLondon, formatNumber, isYmd } from './time';
 
 export interface OgCardInput {
 	state: SiteState;
@@ -54,7 +54,7 @@ function validDate(iso: string): Date | null {
 }
 
 function formatCount(n: number): string {
-	return Math.max(0, Math.floor(n)).toLocaleString('en-GB');
+	return formatNumber(Math.max(0, Math.floor(n)));
 }
 
 /** The telemetry line and dry subline for a state. Exported for tests. */

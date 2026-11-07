@@ -173,8 +173,8 @@ describe('preview comment', () => {
 });
 
 describe('workflows', () => {
-	it('has CI, deploy, preview and setup workflows', () => {
-		expect(Object.keys(workflows).sort()).toEqual(['ci.yml', 'deploy.yml', 'preview.yml', 'setup.yml']);
+	it('has CI, deploy, diagnose, preview and setup workflows', () => {
+		expect(Object.keys(workflows).sort()).toEqual(['ci.yml', 'deploy.yml', 'diagnose.yml', 'preview.yml', 'setup.yml']);
 	});
 
 	it('only runs setup by hand, and never alongside a production deploy', () => {

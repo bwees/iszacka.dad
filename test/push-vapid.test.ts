@@ -19,6 +19,7 @@ import {
 	parseVapidKeys,
 	signVapidJwt,
 	VAPID_MAX_TTL_SECONDS,
+	VAPID_REUSE_MARGIN_SECONDS,
 	VAPID_SUBJECT,
 	vapidClaims,
 	vapidHeaderForEndpoint,
@@ -124,6 +125,21 @@ describe('VAPID JWT', () => {
 		expect(await verifyVapidJwt(jwt, other.publicKey)).toBeNull();
 		expect(nodeVerifies(jwt, other.publicKey)).toBe(false);
 		expect(await verifyVapidJwt('not.a.jwt', keys.publicKey)).toBeNull();
+	});
+
+	it('reuses a signed header per push service until it nears expiry', async () => {
+		settings.clear();
+		const env = { DB: {} } as unknown as Env;
+		const now = Date.parse('2026-11-19T03:00:00Z');
+		const first = await vapidHeaderForEndpoint(env, 'https://fcm.googleapis.com/fcm/send/a', now);
+		expect(await vapidHeaderForEndpoint(env, 'https://fcm.googleapis.com/fcm/send/b', now + 60_000)).toBe(first);
+		expect(await vapidHeaderForEndpoint(env, 'https://web.push.apple.com/c', now)).not.toBe(first);
+		// With under an hour of its 12 left, a fresh one is signed.
+		const later = now + (VAPID_MAX_TTL_SECONDS - VAPID_REUSE_MARGIN_SECONDS + 1) * 1000;
+		const refreshed = await vapidHeaderForEndpoint(env, 'https://fcm.googleapis.com/fcm/send/a', later);
+		expect(refreshed).not.toBe(first);
+		const jwt = /^vapid t=(\S+),/.exec(refreshed)?.[1] ?? '';
+		expect(decodeJson(jwt.split('.')[1] ?? '').exp).toBe(Math.floor(later / 1000) + VAPID_MAX_TTL_SECONDS);
 	});
 
 	it('builds the Authorization header as "vapid t=<jwt>, k=<key>"', async () => {

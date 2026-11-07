@@ -1,11 +1,10 @@
 // The single source of truth for "is Zack a dad?", stored in D1 `settings`.
 
 import { isStatus, type SiteState, type Status, type Update } from '../types';
-import { appendLedger } from './ledger';
 import { broadcast } from './live';
 import { STATUS_COPY } from './site';
 import { isYmd, nowIso } from './time';
-import { createUpdate } from './updates';
+import { insertUpdateStatement, launchAnnouncement, rowToUpdate, type UpdateRow } from './updates';
 
 // Tiny per-isolate cache so a burst of requests costs one D1 read. Writes in this
 // isolate invalidate it; other isolates converge within the TTL.
@@ -66,35 +65,39 @@ export interface StatusChange {
 }
 
 /**
- * Change the answer. Records history, appends to the Dad Ledger, publishes an
- * update (which broadcasts live and starts the announce workflow), and pushes
- * the new state to every open browser. Returns null if the status is unchanged.
+ * Change the answer. One D1 batch writes the status, its history row and the public update;
+ * then the announce workflow starts and this returns. The workflow's first steps (each with
+ * its own CPU budget and retries) push the new state and the update to every open browser,
+ * sign the change into the Dad Ledger and update the DNS answer record; after a 60-second
+ * undo window it notifies subscribers. Returns null if the status is unchanged.
  */
 export async function setStatus(env: Env, status: Status, opts: { note?: string } = {}): Promise<StatusChange | null> {
 	const current = await getState(env, { fresh: true });
 	if (current.status === status) return null;
 
 	const at = nowIso();
-	await env.DB.batch([
+	const copy = STATUS_COPY[status];
+	const note = opts.note?.trim() || null;
+	const [, , inserted] = await env.DB.batch<UpdateRow>([
 		env.DB.prepare(
 			`INSERT INTO settings (key, value, updated_at) VALUES ('status', ?1, ?2), ('status_changed_at', ?2, ?2)
 			 ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
 		).bind(status, at),
 		env.DB.prepare('INSERT INTO status_history (status, at) VALUES (?, ?)').bind(status, at),
+		insertUpdateStatement(env, { kind: 'status', title: copy.headline, body: note ?? copy.sentence, status, audience: 'all' }),
 	]);
 	invalidateStateCache();
+	const row = inserted?.results[0];
+	if (!row) throw new Error('Failed to insert the status update');
+	const update: Update = rowToUpdate(row);
 	const state: SiteState = { ...current, status, statusChangedAt: at };
 
-	const copy = STATUS_COPY[status];
-	await appendLedger(env, { status, note: opts.note?.trim() || copy.ledgerNote });
-	await broadcast(env, { type: 'state', state });
-	const update = await createUpdate(env, {
-		kind: 'status',
-		title: copy.headline,
-		body: opts.note?.trim() || copy.sentence,
-		status,
-		audience: 'all',
-	});
+	const started = await launchAnnouncement(env, update.id, { publish: true, ledgerNote: note ?? copy.ledgerNote });
+	if (!started) {
+		// No workflow, so nothing else will flip the open browsers: do at least that here.
+		await broadcast(env, { type: 'state', state });
+		await broadcast(env, { type: 'update', update });
+	}
 	return { state, update };
 }
 

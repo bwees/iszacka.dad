@@ -1,46 +1,64 @@
-// OWNER: email agent.
-// Durable fan-out of one update to email, push, webhooks, DNS and the OG image.
+// OWNER: notify agent.
+// Durable fan-out of one update to browsers, the ledger, DNS, push, webhooks and email.
+//
+// Every step has to fit the Workers Free budget of 10 ms CPU (and 50 external subrequests),
+// so the work is cut into small steps, each with its own budget and retries:
 //
 // 1. Load the update.
-// 2. Status updates: sleep through a 60s grace period, then re-check. If the status has
-//    changed again (or was flipped back to what the world was last told), skip notifying,
-//    record why (settings `superseded:<id>`, for /updates/:id), and for a revert re-sync DNS.
-// 3. Push, then webhooks, in batches of 25 by id cursor, one step per batch. Each batch skips
-//    recipients that already have a delivery row and records every outcome, so step retries
-//    and admin re-runs never contact anyone twice.
-// 4. Status updates: update the DNS TXT answer record (from fresh state).
-// 5. Re-render the OG image.
-// 6. Email, last, because it is the only channel with a quota: when the day's quota runs out
-//    mid-batch, real news (audience 'all') sleeps until 00:00 UTC and carries on from the same
-//    cursor (after checking the update isn't stale by then); anything else stops at
-//    DAILY_EMAIL_RESERVE and is dropped, not sent tomorrow. Email waiting on the quota never
-//    delays push, webhooks or DNS.
-// 7. Mark the update notified, and return a serialisable summary.
+// 2. First run only (params.publish, set by whoever created the update): broadcast the fresh
+//    state (status updates) and the update to every open browser, and sign a status change
+//    into the Dad Ledger. One step each. Status updates then write the DNS TXT answer record
+//    from fresh state. All of this used to happen inside the admin's request.
+// 3. Status updates: sleep through a 60s grace period, then re-check. If the status has
+//    changed again (or was flipped back to what the world was last told), skip notifying and
+//    record why (settings `superseded:<id>`, for /updates/:id).
+// 4. Push, then webhooks, PUSH_BATCH_SIZE / WEBHOOK_BATCH_SIZE targets per step by id cursor.
+//    Each batch skips recipients that already have a delivery row and records every outcome
+//    in one D1 batch, so step retries and admin re-runs never contact anyone twice.
+// 5. Email, last, because it is the only channel with a quota, EMAIL_BATCH_SIZE per step with
+//    one request to Resend's batch endpoint. When the day's quota runs out mid-batch, real
+//    news (audience 'all') sleeps until 00:00 UTC and carries on from the same cursor (after
+//    checking the update isn't stale by then); anything else stops at DAILY_EMAIL_RESERVE and
+//    is dropped, not sent tomorrow. Email waiting on the quota never delays push or webhooks.
+// 6. Mark the update notified, and return a serialisable summary.
 
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep, type WorkflowStepConfig } from 'cloudflare:workers';
-import { type DeliverySummary, deliveredTargets, deliverySummary, recordDelivery } from '../lib/deliveries';
-import { renderOgImage } from '../lib/og';
+import { type DeliverySummary, deliveredTargets, deliverySummary, recordDeliveries, recordDelivery } from '../lib/deliveries';
+import { appendLedger } from '../lib/ledger';
+import { waitingRoom } from '../lib/live';
+import { STATUS_COPY } from '../lib/site';
 import { getState, setSetting } from '../lib/state';
 import { londonDate } from '../lib/time';
-import { getUpdate, markNotified } from '../lib/updates';
+import { getUpdate, markNotified, type PublishParams } from '../lib/updates';
 import { updateAnswerRecord } from '../notify/dns';
-import { DAILY_EMAIL_RESERVE, deliverEmail, isQuotaCode, listEmailTargets } from '../notify/email';
-import { deliverPush, listPushTargets } from '../notify/push';
-import { deliverWebhook, listWebhookTargets } from '../notify/webhooks';
+import { DAILY_EMAIL_RESERVE, deliverEmailBatch, isQuotaCode, listEmailTargets } from '../notify/email';
+import { deliverPushBatch, listPushTargets } from '../notify/push';
+import { deliverWebhookBatch, listWebhookTargets } from '../notify/webhooks';
 import type { Audience, Channel, DeliveryResult, SiteState, Status, Update, UpdateKind } from '../types';
 
-export interface AnnounceParams {
+export interface AnnounceParams extends PublishParams {
 	updateId: number;
 }
 
-export const BATCH_SIZE = 25;
-/** Per channel. 300 × 25 = 7,500 recipients, comfortably inside the per-instance step limit. */
+/** Default targets per step (the email channel's size: one Resend request per step). */
+export const BATCH_SIZE = 20;
+/** Emails per step: rendering and one batch request to Resend, well inside 10 ms. */
+export const EMAIL_BATCH_SIZE = BATCH_SIZE;
+/** Pushes per step: up to two fetches each (one retry), so at most 20 subrequests. */
+export const PUSH_BATCH_SIZE = 10;
+/** Webhooks per step: one fetch each. */
+export const WEBHOOK_BATCH_SIZE = 10;
+/**
+ * Batches per channel. Three channels × 300 stays under the 1,024 steps a Workflow instance
+ * may take, and 300 × 10 = 3,000 push subscriptions or webhooks per run.
+ */
 export const MAX_BATCHES = 300;
 /**
  * Pages of already-delivered targets one step may walk past before it finds work, so a re-run
- * reaches the recipients beyond the first 7,500 without spending a step per skipped batch.
+ * reaches recipients beyond the first pages without spending a step per skipped batch. Each
+ * page costs two D1 queries, so this stays small enough for one step's CPU budget.
  */
-export const MAX_SKIP_PAGES = 40;
+export const MAX_SKIP_PAGES = 10;
 /** Midnight quota waits per run, so a refusal that never clears can't loop for days. */
 export const MAX_QUOTA_WAITS = 3;
 export const RETRY_LIMIT = 3;
@@ -48,7 +66,13 @@ export const STEP_CONFIG: WorkflowStepConfig = {
 	retries: { limit: RETRY_LIMIT, delay: '10 seconds', backoff: 'exponential' },
 	timeout: '5 minutes',
 };
+/** The live flip: retried quickly, since browsers are waiting on it. */
+export const LIVE_STEP_CONFIG: WorkflowStepConfig = {
+	retries: { limit: RETRY_LIMIT, delay: '2 seconds', backoff: 'exponential' },
+	timeout: '1 minute',
+};
 export const GRACE_PERIOD = '60 seconds';
+/** For channels delivered one target at a time (see perTarget). */
 const CONCURRENCY = 5;
 
 /**
@@ -93,12 +117,21 @@ export interface BatchOutcome {
 	deferred: number;
 }
 
+/** One delivery row to write. */
+export interface DeliveryRecord {
+	id: number;
+	ok: boolean;
+	detail: string;
+}
+
 export interface BatchDeps<T extends { id: number }> {
 	list(afterId: number, limit: number): Promise<T[]>;
 	/** Of these ids, which must not be contacted again for this update. */
 	done(ids: number[]): Promise<Set<number>>;
-	deliver(target: T): Promise<Attempt>;
-	record(targetId: number, ok: boolean, detail: string): Promise<void>;
+	/** Deliver to every target of the batch: one Attempt per target, in the same order. */
+	deliver(targets: T[]): Promise<Attempt[]>;
+	/** Write the batch's outcomes, all at once. */
+	record(entries: DeliveryRecord[]): Promise<void>;
 }
 
 export interface BatchOptions {
@@ -106,7 +139,6 @@ export interface BatchOptions {
 	/** Throw on retryable failures (so the step retries just those) until the final attempt. */
 	retryInStep: boolean;
 	finalAttempt: boolean;
-	concurrency?: number;
 	/** On a quota attempt, stop the batch and leave the rest unrecorded (else: an ordinary retryable failure). */
 	stopOnQuota?: boolean;
 	maxSkipPages?: number;
@@ -122,32 +154,34 @@ function errorMessage(err: unknown): string {
 }
 
 /**
- * Run `fn` over `items` with at most `limit` in flight. Stops picking up work after an error
- * (then rethrows it) or once `stop()` says so (in-flight work still finishes).
+ * Turn a one-target delivery function into a batch one, with at most `limit` in flight. A
+ * throwing delivery counts as a transient failure.
  */
-async function eachLimit<T>(items: readonly T[], limit: number, fn: (item: T) => Promise<void>, stop: () => boolean = () => false): Promise<void> {
-	let next = 0;
-	let failure: { error: unknown } | null = null;
-	const worker = async () => {
-		while (!failure && !stop() && next < items.length) {
-			const item = items[next++] as T;
-			try {
-				await fn(item);
-			} catch (error) {
-				failure ??= { error };
+export function perTarget<T>(fn: (target: T) => Promise<Attempt>, limit = CONCURRENCY): (targets: T[]) => Promise<Attempt[]> {
+	return async (targets) => {
+		const out: Attempt[] = new Array(targets.length);
+		let next = 0;
+		const worker = async () => {
+			while (next < targets.length) {
+				const i = next++;
+				try {
+					out[i] = await fn(targets[i] as T);
+				} catch (err) {
+					out[i] = { ok: false, retryable: true, detail: errorMessage(err) };
+				}
 			}
-		}
+		};
+		await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, targets.length)) }, worker));
+		return out;
 	};
-	await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, worker));
-	if (failure) throw (failure as { error: unknown }).error;
 }
 
 /**
  * Deliver one batch: list targets after the cursor (one extra, to know whether more follow),
- * walk past pages where everyone is already done, deliver the rest and record each outcome as
- * it happens. If retryable failures remain and attempts are left, throw so the step is
- * retried; the retry skips everyone already recorded. If the email quota runs out (and
- * `stopOnQuota`), stop early without recording the unsent and report `quotaHit`.
+ * walk past pages where everyone is already done, deliver the rest in one go and record every
+ * outcome in one write. If retryable failures remain and attempts are left, throw so the step
+ * is retried; the retry skips everyone already recorded. If the email quota runs out (and
+ * `stopOnQuota`), the unsent are left unrecorded and the outcome reports `quotaHit`.
  */
 export async function runBatch<T extends { id: number }>(
 	deps: BatchDeps<T>,
@@ -183,60 +217,53 @@ export async function runBatch<T extends { id: number }>(
 		cursor = outcome.lastId;
 	}
 	if (pending.length === 0) return outcome;
-	let toRetry = 0;
-	let quotaHit = false;
 
-	await eachLimit(
-		pending,
-		opts.concurrency ?? CONCURRENCY,
-		async (target) => {
-			let attempt: Attempt;
-			try {
-				attempt = await deps.deliver(target);
-			} catch (err) {
-				// Delivery functions shouldn't throw, but if one does, treat it as transient.
-				attempt = { ok: false, retryable: true, detail: errorMessage(err) };
-			}
-			if (attempt.quota && opts.stopOnQuota) {
-				// Not attempted: no record, so the same batch repeated after the reset sends it.
-				quotaHit = true;
+	let attempts: Attempt[];
+	try {
+		attempts = await deps.deliver(pending);
+	} catch (err) {
+		// Delivery functions shouldn't throw, but if one does, treat the batch as transient.
+		attempts = pending.map(() => ({ ok: false, retryable: true, detail: errorMessage(err) }));
+	}
+	const attemptOf = (i: number): Attempt => attempts[i] ?? { ok: false, retryable: true, detail: 'no delivery result' };
+	// Not attempted for lack of quota: no record, so the same batch repeated after the reset sends it.
+	const quotaHit = opts.stopOnQuota === true && pending.some((_, i) => attemptOf(i).quota === true);
+
+	const records: DeliveryRecord[] = [];
+	let toRetry = 0;
+	pending.forEach((target, i) => {
+		const attempt = attemptOf(i);
+		const detail = (attempt.detail ?? '').slice(0, 400);
+		if (attempt.ok) {
+			records.push({ id: target.id, ok: true, detail: detail || 'ok' });
+			outcome.sent++;
+		} else if (attempt.gone) {
+			records.push({ id: target.id, ok: false, detail: `gone: ${detail}` });
+			outcome.failed++;
+			outcome.gone++;
+		} else if (attempt.retryable || attempt.quota) {
+			// Transient failures alongside a quota hit are left unrecorded too: the repeat gets them.
+			if (quotaHit) return;
+			if (opts.retryInStep && !opts.finalAttempt) {
+				toRetry++;
 				return;
 			}
-			await settle(target, attempt);
-		},
-		() => quotaHit,
-	);
+			records.push({ id: target.id, ok: false, detail: `retryable: ${detail}` });
+			outcome.failed++;
+			outcome.deferred++;
+		} else {
+			records.push({ id: target.id, ok: false, detail: `failed: ${detail}` });
+			outcome.failed++;
+		}
+	});
+	if (records.length) await deps.record(records);
 
 	if (quotaHit) {
-		// Transient failures alongside a quota hit are left unrecorded too: the repeat gets them.
 		outcome.quotaHit = true;
 		return outcome;
 	}
 	if (toRetry > 0) throw new RetryableBatchError(`${toRetry} of ${pending.length} deliveries hit transient errors; retrying`);
 	return outcome;
-
-	async function settle(target: T, attempt: Attempt): Promise<void> {
-		const detail = (attempt.detail ?? '').slice(0, 400);
-		if (attempt.ok) {
-			await deps.record(target.id, true, detail || 'ok');
-			outcome.sent++;
-		} else if (attempt.gone) {
-			await deps.record(target.id, false, `gone: ${detail}`);
-			outcome.failed++;
-			outcome.gone++;
-		} else if (attempt.retryable) {
-			if (opts.retryInStep && !opts.finalAttempt) {
-				toRetry++;
-				return;
-			}
-			await deps.record(target.id, false, `retryable: ${detail}`);
-			outcome.failed++;
-			outcome.deferred++;
-		} else {
-			await deps.record(target.id, false, `failed: ${detail}`);
-			outcome.failed++;
-		}
-	}
 }
 
 export interface ChannelTotals {
@@ -277,7 +304,7 @@ export interface FanOutOptions {
 	maxQuotaWaits?: number;
 }
 
-/** Walk a channel's targets by id cursor, one step per batch ("email after 0", "email after 25"...). */
+/** Walk a channel's targets by id cursor, one step per batch ("email after 0", "email after 20"...). */
 export async function fanOut<T extends { id: number }>(label: string, runStep: RunStep, deps: BatchDeps<T>, opts: FanOutOptions): Promise<ChannelTotals> {
 	const batchSize = opts.batchSize ?? BATCH_SIZE;
 	const maxBatches = opts.maxBatches ?? MAX_BATCHES;
@@ -363,12 +390,16 @@ export function judgeSupersession(updateStatus: Status, currentStatus: Status, l
 	return null;
 }
 
-/** Status of the most recent earlier status update that actually reached anyone. */
+/**
+ * Status of the most recent earlier status update that actually reached anyone. Only the
+ * channels that reach people count: every status update writes DNS straight away.
+ */
 async function lastAnnouncedStatus(env: Env, beforeId: number): Promise<Status | null> {
 	const row = await env.DB.prepare(
 		`SELECT u.status FROM updates u
 		 WHERE u.kind = 'status' AND u.id < ?
-		   AND (u.notified_at IS NOT NULL OR EXISTS (SELECT 1 FROM deliveries d WHERE d.update_id = u.id))
+		   AND (u.notified_at IS NOT NULL OR EXISTS (
+		     SELECT 1 FROM deliveries d WHERE d.update_id = u.id AND d.channel IN ('email', 'push', 'webhook')))
 		 ORDER BY u.id DESC LIMIT 1`,
 	)
 		.bind(beforeId)
@@ -376,32 +407,36 @@ async function lastAnnouncedStatus(env: Env, beforeId: number): Promise<Status |
 	return row?.status ?? null;
 }
 
-// ─── Idempotency helpers ─────────────────────────────────────────────────────
+// ─── Publishing (the first steps) ────────────────────────────────────────────
+
+export type LedgerReport = { seq: number } | { skipped: string };
 
 /**
- * Targets that must not be contacted again. On a re-run (instance id "update-N-rK"), targets
- * whose earlier delivery failed transiently are given another go.
+ * Sign a status change into the Dad Ledger, once. Skipped if a newer status change already
+ * exists (its own run records it, and the ledger must stay in order) or if the ledger's newest
+ * entry already says this status (a retry after a write that did land). Throws on failure, so
+ * the step retries.
  */
-async function doneTargets(env: Env, updateId: number, channel: Channel, ids: number[], rerun: boolean): Promise<Set<number>> {
-	const done = await deliveredTargets(env, updateId, channel, ids);
-	if (!rerun || done.size === 0) return done;
-	const doneIds = [...done];
-	const { results } = await env.DB.prepare(
-		`SELECT target_id FROM deliveries WHERE update_id = ? AND channel = ? AND ok = 0 AND detail LIKE 'retryable:%'
-		 AND target_id IN (${doneIds.map(() => '?').join(', ')})`,
-	)
-		.bind(updateId, channel, ...doneIds)
-		.all<{ target_id: number }>();
-	for (const r of results) done.delete(r.target_id);
-	return done;
+export async function ledgerStatusChange(env: Env, update: Pick<Update, 'id' | 'status'>, note: string): Promise<LedgerReport> {
+	const [head, newer] = await env.DB.batch<{ status?: Status; hit?: number }>([
+		env.DB.prepare('SELECT status FROM ledger ORDER BY seq DESC LIMIT 1'),
+		env.DB.prepare("SELECT 1 AS hit FROM updates WHERE kind = 'status' AND id > ? LIMIT 1").bind(update.id),
+	]);
+	if (newer?.results[0]) return { skipped: 'a newer status change has been made since' };
+	if (head?.results[0]?.status === update.status) return { skipped: `the ledger already says '${update.status}'` };
+	const entry = await appendLedger(env, { status: update.status, note });
+	if (!entry) throw new RetryableBatchError('the ledger append failed');
+	return { seq: entry.seq };
 }
+
+// ─── Idempotency helpers ─────────────────────────────────────────────────────
 
 export interface SingleReport {
 	ok: boolean;
 	detail: string | null;
 }
 
-/** A one-off delivery (DNS, OG) inside a step: retried via the step until the final attempt. */
+/** A one-off delivery (DNS) inside a step: retried via the step until the final attempt. */
 async function singleDelivery(
 	run: () => Promise<DeliveryResult>,
 	record: (ok: boolean, detail: string) => Promise<void>,
@@ -432,11 +467,12 @@ export interface AnnounceSummary {
 	superseded?: true;
 	reason?: SupersededReason;
 	currentStatus?: Status;
+	live?: { state?: true | { error: string }; update?: true | { error: string } };
+	ledger?: LedgerReport | { error: string };
 	email?: ChannelReport;
 	push?: ChannelReport;
 	webhook?: ChannelReport;
 	dns?: SingleReport | { skipped: string } | { error: string };
-	og?: SingleReport | { error: string };
 	deliveries?: DeliverySummary[];
 }
 
@@ -450,25 +486,59 @@ async function isolate<T>(label: string, fn: () => Promise<T>): Promise<T | { er
 	}
 }
 
-export async function announce(env: Env, updateId: number, instanceId: string, step: WorkflowStep): Promise<AnnounceSummary> {
+export async function announce(env: Env, updateId: number, instanceId: string, step: WorkflowStep, params: PublishParams = {}): Promise<AnnounceSummary> {
 	const rerun = /-r\d+$/.test(instanceId);
 
 	const update: Update | null = await step.do('load update', STEP_CONFIG, () => getUpdate(env, updateId));
 	if (!update) return { updateId, skipped: 'update not found' };
 	const base = { updateId, kind: update.kind, audience: update.audience, status: update.status };
-	if (update.audience === 'none') return { ...base, skipped: "audience is 'none'" };
+	const summary: AnnounceSummary = { ...base };
 
-	const syncDns = () =>
-		isolate('dns', () =>
-			step.do('update DNS answer record', STEP_CONFIG, (ctx) =>
+	// Publishing: what the admin's request used to do inline, now one budgeted step each.
+	if (params.publish) {
+		const live: NonNullable<AnnounceSummary['live']> = {};
+		if (update.kind === 'status') {
+			// Fresh state, not this update's: if steps of two quick flips interleave, browsers still end on the truth.
+			const sent = await isolate('live state', () =>
+				step.do('broadcast state', LIVE_STEP_CONFIG, async () => {
+					await waitingRoom(env).broadcast({ type: 'state', state: await getState(env, { fresh: true }) });
+					return true as const;
+				}),
+			);
+			live.state = sent;
+		}
+		live.update = await isolate('live update', () =>
+			step.do('broadcast update', LIVE_STEP_CONFIG, async () => {
+				await waitingRoom(env).broadcast({ type: 'update', update });
+				return true as const;
+			}),
+		);
+		summary.live = live;
+		if (update.kind === 'status') {
+			const note = params.ledgerNote ?? STATUS_COPY[update.status].ledgerNote;
+			summary.ledger = await isolate('ledger', () =>
+				step.do('append to ledger', STEP_CONFIG, () => ledgerStatusChange(env, update, note)),
+			);
+		}
+	}
+
+	// The DNS answer mirrors the site, which has already flipped: write it now, from fresh state
+	// read inside the step (whichever run writes last writes the truth).
+	if (update.kind === 'status') {
+		summary.dns = await isolate('dns', () =>
+			step.do('update DNS answer record', STEP_CONFIG, async (ctx) =>
 				singleDelivery(
-					// Fresh state, read inside the step: whichever run writes last writes the truth.
 					async () => updateAnswerRecord(env, await getState(env, { fresh: true })),
 					(ok, detail) => recordDelivery(env, update.id, 'dns', 0, ok, detail),
 					isFinalAttempt(ctx.attempt),
 				),
 			),
 		);
+	} else {
+		summary.dns = { skipped: 'only status updates touch DNS' };
+	}
+
+	if (update.audience === 'none') return { ...summary, skipped: "audience is 'none'" };
 
 	let state: SiteState;
 	if (update.kind === 'status') {
@@ -488,9 +558,7 @@ export async function announce(env: Env, updateId: number, instanceId: string, s
 					return true;
 				}),
 			);
-			// A revert has no newer update to rewrite the DNS record (and refresh `since=`).
-			const dns = check.reason === 'reverted' ? await syncDns() : undefined;
-			return { ...base, superseded: true, reason: check.reason, currentStatus: check.state.status, ...(dns ? { dns } : {}) };
+			return { ...summary, superseded: true, reason: check.reason, currentStatus: check.state.status };
 		}
 		state = check.state;
 	} else {
@@ -498,8 +566,15 @@ export async function announce(env: Env, updateId: number, instanceId: string, s
 	}
 
 	const runStep: RunStep = (name, fn) => step.do(name, STEP_CONFIG, (ctx) => fn(ctx.attempt));
-	const record = (channel: Channel) => (id: number, ok: boolean, detail: string) => recordDelivery(env, update.id, channel, id, ok, detail);
-	const done = (channel: Channel) => (ids: number[]) => doneTargets(env, update.id, channel, ids, rerun);
+	const record = (channel: Channel) => (entries: DeliveryRecord[]) =>
+		recordDeliveries(
+			env,
+			update.id,
+			channel,
+			entries.map((e) => ({ targetId: e.id, ok: e.ok, detail: e.detail })),
+		);
+	// On a re-run (instance id "update-N-rK"), targets whose delivery failed transiently get another go.
+	const done = (channel: Channel) => (ids: number[]) => deliveredTargets(env, update.id, channel, ids, { retryRetryable: rerun });
 
 	// The channels without a quota go first, so email waiting for its quota never holds them up.
 
@@ -513,12 +588,12 @@ export async function announce(env: Env, updateId: number, instanceId: string, s
 						{
 							list: (after, limit) => listPushTargets(env, after, limit),
 							done: done('push'),
-							deliver: async (sub) => toAttempt(await deliverPush(env, sub, update)),
+							deliver: async (subs) => (await deliverPushBatch(env, subs)).map(toAttempt),
 							record: record('push'),
 						},
 						// Push/webhook delivery keeps its own failure counters, so no in-step retries:
 						// one attempt per run, with transient failures left for a re-run.
-						{ retryInStep: false },
+						{ retryInStep: false, batchSize: PUSH_BATCH_SIZE },
 					),
 				)
 			: { skipped: `audience is '${update.audience}'` };
@@ -530,22 +605,10 @@ export async function announce(env: Env, updateId: number, instanceId: string, s
 			{
 				list: (after, limit) => listWebhookTargets(env, update.audience, after, limit),
 				done: done('webhook'),
-				deliver: async (hook) => toAttempt(await deliverWebhook(env, hook, update, state)),
+				deliver: async (hooks) => (await deliverWebhookBatch(env, hooks, update, state)).map(toAttempt),
 				record: record('webhook'),
 			},
-			{ retryInStep: false },
-		),
-	);
-
-	const dns = update.kind === 'status' ? await syncDns() : { skipped: 'only status updates touch DNS' };
-
-	const og = await isolate('og', () =>
-		step.do('render OG image', STEP_CONFIG, (ctx) =>
-			singleDelivery(
-				() => renderOgImage(env),
-				(ok, detail) => recordDelivery(env, update.id, 'og', 0, ok, detail),
-				isFinalAttempt(ctx.attempt),
-			),
+			{ retryInStep: false, batchSize: WEBHOOK_BATCH_SIZE },
 		),
 	);
 
@@ -570,10 +633,11 @@ export async function announce(env: Env, updateId: number, instanceId: string, s
 			{
 				list: (after, limit) => listEmailTargets(env, update.audience, after, limit),
 				done: done('email'),
-				deliver: async (sub) => toAttempt(await deliverEmail(env, sub, update, { reserve: realNews ? 0 : DAILY_EMAIL_RESERVE })),
+				deliver: async (subs) =>
+					(await deliverEmailBatch(env, subs, update, { reserve: realNews ? 0 : DAILY_EMAIL_RESERVE })).map(toAttempt),
 				record: record('email'),
 			},
-			{ retryInStep: true, onQuota },
+			{ retryInStep: true, onQuota, batchSize: EMAIL_BATCH_SIZE },
 		),
 	);
 
@@ -585,18 +649,17 @@ export async function announce(env: Env, updateId: number, instanceId: string, s
 	const deliveries = await isolate('summary', () => step.do('summarise deliveries', STEP_CONFIG, () => deliverySummary(env, update.id)));
 
 	return {
-		...base,
+		...summary,
 		email,
 		push,
 		webhook,
-		dns,
-		og,
 		...(Array.isArray(deliveries) ? { deliveries } : {}),
 	};
 }
 
 export class AnnounceWorkflow extends WorkflowEntrypoint<Env, AnnounceParams> {
 	async run(event: WorkflowEvent<AnnounceParams>, step: WorkflowStep): Promise<unknown> {
-		return announce(this.env, event.payload.updateId, event.instanceId, step);
+		const { updateId, publish, ledgerNote } = event.payload;
+		return announce(this.env, updateId, event.instanceId, step, { publish, ledgerNote });
 	}
 }

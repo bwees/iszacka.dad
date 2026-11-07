@@ -16,7 +16,6 @@
     "deploy": "wrangler deploy"
   },
   "dependencies": {
-    "@cloudflare/puppeteer": "^1.4.0",
     "hono": "^4.13.16",
     "qrcode-generator": "^2.0.4"
   },

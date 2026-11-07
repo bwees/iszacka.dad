@@ -16,6 +16,27 @@ import { SITE_NAME, STATUS_COPY, siteUrl } from './site';
 
 export type Html = HtmlEscapedString | Promise<HtmlEscapedString>;
 
+/**
+ * A per-isolate cache for pure HTML fragments: `cache(key, render)` renders once per key and
+ * then hands back the same markup. The key must capture everything the fragment depends on
+ * (typically the status, the due date and the London date). Bounded: it empties rather than
+ * grows, so request-derived keys can't fill memory. Fragments must render synchronously.
+ */
+export function fragmentCache(max = 32): (key: string, render: () => Html) => HtmlEscapedString {
+	const entries = new Map<string, string>();
+	return (key, render) => {
+		let markup = entries.get(key);
+		if (markup === undefined) {
+			const rendered = render();
+			if (rendered instanceof Promise) throw new Error('fragmentCache: fragments must render synchronously');
+			markup = rendered.toString();
+			if (entries.size >= max) entries.clear();
+			entries.set(key, markup);
+		}
+		return raw(markup);
+	};
+}
+
 export interface PageOptions {
 	/** Page title. The shell appends " · Is Zack a Dad?" (except on the homepage). */
 	title: string;
@@ -130,8 +151,15 @@ export function buildId(env: Partial<Env> | undefined): { id: string; tag: strin
 	}
 }
 
+let clientCopy: string | undefined;
+
 /** Static per-status copy for /app.js (it has no other way to know the words). */
 function clientCopyJson(): string {
+	clientCopy ??= buildClientCopyJson();
+	return clientCopy;
+}
+
+function buildClientCopyJson(): string {
 	const copy = Object.fromEntries(
 		STATUSES.map((s: Status) => {
 			const { word, short, headline, sentence, emoji, header } = STATUS_COPY[s];
@@ -145,9 +173,10 @@ function clientCopyJson(): string {
 /**
  * The social preview image URL, versioned by the status and when it last changed.
  * Facebook, WhatsApp, X, Slack and friends cache og:image by URL and ignore max-age,
- * so an unversioned /og.png would keep showing the old answer after the flip. The
- * /og.png route matches on the path only, so the query string is just a cache key.
- * (No daily component: the cron re-renders at 09:00 UTC, not at London midnight.)
+ * so an unversioned /og.png would keep showing the old answer after the flip. /og.png
+ * serves the pre-rendered card for the status in `v` (lib/og.ts ogVersionStatus reads
+ * this exact format back), so a changed format must change both. The cards never change
+ * by day, so there is no daily component.
  */
 export function ogImageUrl(base: string, state: Pick<SiteState, 'status' | 'statusChangedAt'>): string {
 	const changed = Date.parse(state.statusChangedAt);
@@ -183,52 +212,17 @@ export async function renderPage(c: Context<AppEnv>, opts: PageOptions): Promise
 	const bodyClasses = [opts.bodyClass ?? '', opts.bare ? 'is-bare' : '', isHome ? 'page-home' : ''].filter(Boolean).join(' ');
 	const ogImage = ogImageUrl(base, state);
 
-	const header = html`<header class="site-header">
-	<div class="wrap header-inner">
-		<a href="/" class="brand"${isHome ? raw(' aria-current="page"') : ''}>
-			<svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><path d="M16 3C10 3 5 12 5 19a11 11 0 0 0 22 0C27 12 22 3 16 3Z"/></svg>
-			<span class="brand-name">${SITE_NAME}</span>
-			<span class="brand-answer" data-live="word">${copy.word}</span>
-		</a>
-		<nav class="site-nav" aria-label="Main">
-			<ul>
-				${NAV_LINKS.map(
-					(l) =>
-						html`<li><a href="${l.href}"${isCurrent(l.href, path) ? raw(' aria-current="page"') : ''}${l.href === '/everything' ? raw(' class="nav-cta"') : ''}>${l.label}</a></li>`,
-				)}
-			</ul>
-		</nav>
-	</div>
-</header>`;
-
-	const footer = html`<footer class="site-footer">
-	<div class="wrap">
-		<div class="footer-top">
-			<p class="footer-answer"><span class="kicker">Current answer</span> <span class="footer-sentence" data-live="sentence">${copy.sentence}</span></p>
-			<a class="btn btn-ghost" href="/everything">Tell me the moment it changes</a>
-		</div>
-		<nav class="footer-grid" aria-label="Everything else">
-			${FOOTER_SECTIONS.map(
-				(s) => html`<div class="footer-col">
-					<h2 class="kicker">${s.title}</h2>
-					<ul>
-						${s.links.map((l) => html`<li><a href="${l.href}">${l.label}</a></li>`)}
-					</ul>
-				</div>`,
-			)}
-		</nav>
-		<div class="footer-meta tiny muted">
-			<p>
-				Build <code class="build-id" title="${build?.timestamp ? `Deployed ${build.timestamp}` : 'Local build'}">${build ? (build.tag ?? build.id) : 'local'}</code>
-				· Served by one Cloudflare Worker, a Durable Object, D1, a Workflow and a cron trigger. For a yes/no question.
-			</p>
-			<p>
-				No AI was consulted in determining the answer. No personal data about the baby is stored, shown or wanted.
-				Typeset in Anybody, Atkinson Hyperlegible Next and Martian Mono (<a href="/fonts/OFL-anybody.txt">OFL</a>).
-			</p>
-		</div>
-	</div>
-</footer>`;
+	// The header only varies with the status and which nav links are current (the first is
+	// Home), the footer with the status and the build, so both are rendered once per isolate
+	// per combination. The keys are small and bounded whatever the request path.
+	const header = opts.bare
+		? ''
+		: headerCache(`${state.status}|${NAV_LINKS.map((l) => (isCurrent(l.href, path) ? 1 : 0)).join('')}`, () =>
+				siteHeader(state.status, isHome, path),
+			);
+	const footer = opts.bare
+		? ''
+		: footerCache(`${state.status}|${build ? `${build.tag ?? build.id}|${build.timestamp ?? ''}` : 'local'}`, () => siteFooter(state.status, build));
 
 	const page = html`<!doctype html>
 <html lang="en-GB" data-status="${state.status}" data-page="${isHome ? 'home' : 'page'}" data-title-base="${fullTitle}" data-changed-at="${state.statusChangedAt}" data-due-date="${state.dueDate ?? ''}">
@@ -275,12 +269,67 @@ ${opts.head ?? ''}
 <body class="${bodyClasses}" data-status="${state.status}">
 <a class="skip-link" href="#main">Skip to the answer</a>
 <div class="sr-only" id="announcer" role="status" aria-live="polite" aria-atomic="true" data-announcer></div>
-${opts.bare ? '' : header}
+${header}
 <main id="main" tabindex="-1">${opts.body}</main>
-${opts.bare ? '' : footer}
+${footer}
 </body>
 </html>`;
 	return c.html(page, (opts.status ?? 200) as ContentfulStatusCode);
+}
+
+const headerCache = fragmentCache();
+const footerCache = fragmentCache();
+
+function siteHeader(status: Status, isHome: boolean, path: string): Html {
+	return html`<header class="site-header">
+	<div class="wrap header-inner">
+		<a href="/" class="brand"${isHome ? raw(' aria-current="page"') : ''}>
+			<svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><path d="M16 3C10 3 5 12 5 19a11 11 0 0 0 22 0C27 12 22 3 16 3Z"/></svg>
+			<span class="brand-name">${SITE_NAME}</span>
+			<span class="brand-answer" data-live="word">${STATUS_COPY[status].word}</span>
+		</a>
+		<nav class="site-nav" aria-label="Main">
+			<ul>
+				${NAV_LINKS.map(
+					(l) =>
+						html`<li><a href="${l.href}"${isCurrent(l.href, path) ? raw(' aria-current="page"') : ''}${l.href === '/everything' ? raw(' class="nav-cta"') : ''}>${l.label}</a></li>`,
+				)}
+			</ul>
+		</nav>
+	</div>
+</header>`;
+}
+
+function siteFooter(status: Status, build: ReturnType<typeof buildId>): Html {
+	const copy = STATUS_COPY[status];
+	return html`<footer class="site-footer">
+	<div class="wrap">
+		<div class="footer-top">
+			<p class="footer-answer"><span class="kicker">Current answer</span> <span class="footer-sentence" data-live="sentence">${copy.sentence}</span></p>
+			<a class="btn btn-ghost" href="/everything">Tell me the moment it changes</a>
+		</div>
+		<nav class="footer-grid" aria-label="Everything else">
+			${FOOTER_SECTIONS.map(
+				(s) => html`<div class="footer-col">
+					<h2 class="kicker">${s.title}</h2>
+					<ul>
+						${s.links.map((l) => html`<li><a href="${l.href}">${l.label}</a></li>`)}
+					</ul>
+				</div>`,
+			)}
+		</nav>
+		<div class="footer-meta tiny muted">
+			<p>
+				Build <code class="build-id" title="${build?.timestamp ? `Deployed ${build.timestamp}` : 'Local build'}">${build ? (build.tag ?? build.id) : 'local'}</code>
+				· Served by one Cloudflare Worker, a Durable Object, D1, three Workflows and a cron trigger, in 10 ms of CPU apiece. For a yes/no question.
+			</p>
+			<p>
+				No AI was consulted in determining the answer. No personal data about the baby is stored, shown or wanted.
+				Typeset in Anybody, Atkinson Hyperlegible Next and Martian Mono (<a href="/fonts/OFL-anybody.txt">OFL</a>).
+			</p>
+		</div>
+	</div>
+</footer>`;
 }
 
 /** Browser chrome colour per status and scheme. Mirrors --hero-bg in /styles.css. */

@@ -13,6 +13,7 @@ import { verifyVapidJwt } from '../src/lib/vapid';
 import {
 	classifyPushStatus,
 	deliverPush,
+	deliverPushBatch,
 	isPushServiceHost,
 	listPushTargets,
 	MAX_PUSH_FAILURES,
@@ -173,6 +174,95 @@ describe('deliverPush', () => {
 		const result = await deliverPush(fakeEnv().env, { ...SUB, endpoint: 'https://example.com/collect?id=1' }, UPDATE_YES);
 		expect(result).toMatchObject({ ok: false, gone: true });
 		expect(fetch).not.toHaveBeenCalled();
+	});
+});
+
+describe('deliverPushBatch', () => {
+	const subs: PushSubscriptionRow[] = [
+		{ ...SUB, id: 1, endpoint: 'https://fcm.googleapis.com/fcm/send/one', failures: 0 },
+		{ ...SUB, id: 2, endpoint: 'https://fcm.googleapis.com/fcm/send/two', failures: 3 },
+		{ ...SUB, id: 3, endpoint: 'https://updates.push.services.mozilla.com/wpush/v2/three', failures: 0 },
+		{ ...SUB, id: 4, endpoint: 'https://web.push.apple.com/gone', failures: 0 },
+		{ ...SUB, id: 5, endpoint: 'https://web.push.apple.com/broken', failures: 1 },
+		{ ...SUB, id: 6, endpoint: 'https://example.com/not-a-push-service', failures: 0 },
+	];
+
+	it('pushes the batch, then keeps all the books in one D1 round trip', async () => {
+		const { env, queries, counts } = fakeEnv({}, (q) => (q.sql.includes('RETURNING failures') ? { failures: 2 } : null));
+		const fetch = vi.fn(async (url: string | URL | Request) => {
+			const href = String(url);
+			if (href.endsWith('/gone')) return new Response('gone', { status: 410 });
+			if (href.endsWith('/broken')) return new Response('bad', { status: 400 });
+			return new Response(null, { status: 201 });
+		});
+		vi.stubGlobal('fetch', fetch);
+		const results = await deliverPushBatch(env, subs);
+
+		expect(results.map((r) => [r.ok, r.gone ?? false])).toEqual([
+			[true, false],
+			[true, false],
+			[true, false],
+			[false, true],
+			[false, false],
+			[false, true],
+		]);
+		expect(results[4]?.detail).toBe(`HTTP 400: bad (failure 2 of ${MAX_PUSH_FAILURES})`);
+		expect(fetch).toHaveBeenCalledTimes(5); // the non-push-service endpoint is never contacted
+		expect(counts.batches).toBe(1);
+		expect(queries.every((q) => q.method === 'batch')).toBe(true);
+		// Only the subscription that had failures gets the reset; the healthy ones cost nothing.
+		const resets = queries.filter((q) => q.sql.includes('SET failures = 0'));
+		expect(resets.map((q) => q.binds)).toEqual([[2]]);
+		expect(queries.filter((q) => q.sql.includes('disabled_at = COALESCE')).map((q) => q.binds[1])).toEqual([4, 6]);
+		expect(queries.filter((q) => q.sql.includes('failures + 1')).map((q) => q.binds[2])).toEqual([5]);
+	});
+
+	it('signs one VAPID JWT per push service, not one per push', async () => {
+		const { env } = fakeEnv();
+		const fetch = scriptedFetch([new Response(null, { status: 201 })]);
+		vi.stubGlobal('fetch', fetch.fn);
+		await deliverPushBatch(env, subs.slice(0, 3));
+		// Concurrent pushes reach fetch in any order, so look them up by endpoint.
+		const auth = new Map(fetch.calls.map((c) => [c.url, (c.init.headers as Record<string, string>).Authorization]));
+		const [fcm1, fcm2, mozilla] = subs.slice(0, 3).map((s) => auth.get(s.endpoint));
+		expect(fcm1).toBe(fcm2);
+		expect(mozilla).not.toBe(fcm1); // Mozilla has its own audience
+		const match = /^vapid t=(\S+), k=(\S+)$/.exec(mozilla ?? '');
+		expect((await verifyVapidJwt(match?.[1] ?? '', match?.[2] ?? ''))?.aud).toBe('https://updates.push.services.mozilla.com');
+	});
+
+	it('writes nothing at all when every push lands on a healthy subscription', async () => {
+		const { env, queries, counts } = fakeEnv();
+		vi.stubGlobal('fetch', scriptedFetch([new Response(null, { status: 201 })]).fn);
+		const results = await deliverPushBatch(env, [subs[0] as PushSubscriptionRow, subs[2] as PushSubscriptionRow]);
+		expect(results.every((r) => r.ok)).toBe(true);
+		expect(queries).toHaveLength(0);
+		expect(counts.batches).toBe(0);
+	});
+
+	it('still reports every result when the bookkeeping write fails', async () => {
+		const { env } = fakeEnv();
+		(env.DB as unknown as { batch: () => Promise<never> }).batch = async () => {
+			throw new Error('D1 down');
+		};
+		vi.stubGlobal('fetch', scriptedFetch([new Response('nope', { status: 400 })]).fn);
+		const [result] = await deliverPushBatch(env, [subs[1] as PushSubscriptionRow]);
+		expect(result).toEqual({ ok: false, detail: 'HTTP 400: nope' });
+	});
+
+	it('keeps to six pushes in flight (the per-invocation connection limit)', async () => {
+		const { env } = fakeEnv();
+		let inFlight = 0;
+		let peak = 0;
+		vi.stubGlobal('fetch', async () => {
+			peak = Math.max(peak, ++inFlight);
+			await new Promise((r) => setTimeout(r, 2));
+			inFlight--;
+			return new Response(null, { status: 201 });
+		});
+		const many = Array.from({ length: 10 }, (_, i) => ({ ...SUB, id: i + 1, endpoint: `https://fcm.googleapis.com/fcm/send/${i}` }));
+		expect((await deliverPushBatch(env, many)).every((r) => r.ok)).toBe(true);
+		expect(peak).toBeLessThanOrEqual(6);
 	});
 });
 

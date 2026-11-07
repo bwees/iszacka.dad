@@ -2,16 +2,19 @@
 // Aggregated check counters (checks_daily / checks_hourly / checks_country / checks_colo).
 //
 // A "check" is a human asking whether Zack is a dad (see COUNTED_PATHS in
-// src/index.ts; only answered requests count). Nothing per-visitor is stored: each check
-// bumps an in-memory tally (day, hour, country, colo) in this isolate, and the tally is
-// written to D1 in one batch about every CHECK_FLUSH_DELAY_MS (one upsert per distinct key,
-// `count = count + n`), so D1 writes scale with time, not traffic. Losing a few seconds of
-// counts when an isolate is evicted is fine for a vanity counter. Bots, link previews,
-// monitors, prefetches and refresh polls (`?poll=1`, e.g. the embed widget's timer) are
-// ignored, on the grounds that they have no feelings to measure.
+// src/index.ts; only answered requests count). Nothing per-visitor is stored. The Worker only
+// decides whether a request counts and sends the WaitingRoom Durable Object one tiny
+// fire-and-forget RPC ({day, hour, country, colo}); it does no D1 work for a check. The
+// waiting room tallies checks in memory, writes them to D1 in one batch at most every ~30 s
+// (one upsert per distinct key, `count = count + n`), so D1 writes scale with time, not
+// traffic, and keeps the running total that the live `checks` broadcast, the WebSocket hello
+// and getCheckTotal() report. Losing a few seconds of counts when the object restarts (a
+// deploy) is fine for a vanity counter. Bots, link previews, monitors, prefetches and refresh
+// polls (`?poll=1`, e.g. the embed widget's timer) are ignored, on the grounds that they have
+// no feelings to measure.
 
-import { broadcast } from './live';
-import { addDays, londonDate, londonHour } from './time';
+import { waitingRoom } from './live';
+import { addDays, isYmd, londonDate, londonHour } from './time';
 
 // ── Who counts ───────────────────────────────────────────────────────────────
 
@@ -20,120 +23,123 @@ import { addDays, londonDate, londonHour } from './time';
  * crawlers, link unfurlers, uptime monitors, headless browsers and HTTP libraries.
  * `curl`, `wget` and HTTPie are deliberately absent: a human typing
  * `curl iszacka.dad` is checking, and it shows.
+ *
+ * Matched as plain substrings of the lower-cased user agent, not as one big case-insensitive
+ * regex: compiling that regex cost about 0.6 ms on every cold isolate, and on Workers Free the
+ * whole request gets 10 ms.
  */
-const BOT_PATTERN = new RegExp(
-	[
-		'bot\\b',
-		'bot[/_;-]',
-		'\\bbot',
-		'crawl',
-		'spider',
-		'slurp',
-		'scrap(?:er|y|ing)',
-		'preview',
-		'facebookexternalhit',
-		'facebookcatalog',
-		'meta-external',
-		'slackbot',
-		'slack-',
-		'discordbot',
-		'whatsapp',
-		'skypeuri',
-		'embedly',
-		'iframely',
-		'vkshare',
-		'quora link',
-		'mastodon',
-		'akkoma',
-		'pleroma',
-		'misskey',
-		'bluesky',
-		'cardyb',
-		'outbrain',
-		'validator',
-		'lighthouse',
-		'pagespeed',
-		'chrome-lighthouse',
-		'gtmetrix',
-		'headless',
-		'phantomjs',
-		'puppeteer',
-		'playwright',
-		'selenium',
-		'webdriver',
-		'uptime',
-		'monitor',
-		'pingdom',
-		'statuscake',
-		'site24x7',
-		'newrelic',
-		'datadog',
-		'checkly',
-		'betterstack',
-		'better uptime',
-		'freshping',
-		'hetrix',
-		'ahrefs',
-		'semrush',
-		'mj12',
-		'dataforseo',
-		'bytespider',
-		'gptbot',
-		'chatgpt',
-		'oai-searchbot',
-		'claude',
-		'anthropic',
-		'perplexity',
-		'ccbot',
-		'cohere',
-		'diffbot',
-		'google-extended',
-		'googleother',
-		'google-inspectiontool',
-		'pagerenderer',
-		'feedfetcher',
-		'mediapartners',
-		'python-requests',
-		'python-urllib',
-		'python-httpx',
-		'aiohttp',
-		'go-http-client',
-		'okhttp',
-		'apache-httpclient',
-		'java/',
-		'node-fetch',
-		'axios',
-		'undici',
-		'^node(?:/|$)',
-		'^bun/',
-		'^deno/',
-		'libwww-perl',
-		'http_request2',
-		'guzzlehttp',
-		'nessus',
-		'nikto',
-		'sqlmap',
-		'zgrab',
-		'masscan',
-		'nmap',
-	].join('|'),
-	'i',
-);
+const BOT_SUBSTRINGS = [
+	'crawl',
+	'spider',
+	'slurp',
+	'scraper',
+	'scrapy',
+	'scraping',
+	'preview',
+	'facebookexternalhit',
+	'facebookcatalog',
+	'meta-external',
+	'slackbot',
+	'slack-',
+	'discordbot',
+	'whatsapp',
+	'skypeuri',
+	'embedly',
+	'iframely',
+	'vkshare',
+	'quora link',
+	'mastodon',
+	'akkoma',
+	'pleroma',
+	'misskey',
+	'bluesky',
+	'cardyb',
+	'outbrain',
+	'validator',
+	'lighthouse',
+	'pagespeed',
+	'gtmetrix',
+	'headless',
+	'phantomjs',
+	'puppeteer',
+	'playwright',
+	'selenium',
+	'webdriver',
+	'uptime',
+	'monitor',
+	'pingdom',
+	'statuscake',
+	'site24x7',
+	'newrelic',
+	'datadog',
+	'checkly',
+	'betterstack',
+	'freshping',
+	'hetrix',
+	'ahrefs',
+	'semrush',
+	'mj12',
+	'dataforseo',
+	'bytespider',
+	'gptbot',
+	'chatgpt',
+	'oai-searchbot',
+	'claude',
+	'anthropic',
+	'perplexity',
+	'ccbot',
+	'cohere',
+	'diffbot',
+	'google-extended',
+	'googleother',
+	'google-inspectiontool',
+	'pagerenderer',
+	'feedfetcher',
+	'mediapartners',
+	'python-requests',
+	'python-urllib',
+	'python-httpx',
+	'aiohttp',
+	'go-http-client',
+	'okhttp',
+	'apache-httpclient',
+	'java/',
+	'node-fetch',
+	'axios',
+	'undici',
+	'libwww-perl',
+	'http_request2',
+	'guzzlehttp',
+	'nessus',
+	'nikto',
+	'sqlmap',
+	'zgrab',
+	'masscan',
+	'nmap',
+];
 
-/** Phone brands whose names end in "bot" and would otherwise be mistaken for one. */
-const NOT_ACTUALLY_BOTS = /\bcubot\b/gi;
+/** "bot" as a word, or as the end of one ("Googlebot/2.1", "bot-", "bot_"). Lower case. */
+const BOT_WORD = /bot(?:\b|[/_;-])|\bbot/;
+/** Bare runtimes' default user agents ("node", "Bun/1.1", "Deno/2.0"). Lower case. */
+const BARE_RUNTIME = /^(?:node(?:\/|$)|bun\/|deno\/)/;
+/** Phone brands whose names end in "bot" and would otherwise be mistaken for one. Lower case. */
+const NOT_ACTUALLY_BOTS = /\bcubot\b/g;
 
 /** True if the user agent belongs to something without feelings. A missing UA counts as one. */
 export function isBot(userAgent: string | null | undefined): boolean {
-	const ua = (userAgent ?? '').trim();
+	const ua = (userAgent ?? '').trim().toLowerCase();
 	if (!ua) return true;
-	return BOT_PATTERN.test(ua.replace(NOT_ACTUALLY_BOTS, ''));
+	const s = ua.includes('cubot') ? ua.replace(NOT_ACTUALLY_BOTS, '') : ua;
+	if (BOT_WORD.test(s) || BARE_RUNTIME.test(s)) return true;
+	for (const token of BOT_SUBSTRINGS) if (s.includes(token)) return true;
+	return false;
 }
 
 /** Speculative prefetches aren't checks: the person may never look. */
 export function isPrefetch(headers: Headers): boolean {
-	const purpose = `${headers.get('sec-purpose') ?? ''} ${headers.get('purpose') ?? ''} ${headers.get('x-purpose') ?? ''} ${headers.get('x-moz') ?? ''}`;
-	return /prefetch|preview/i.test(purpose);
+	const purpose =
+		`${headers.get('sec-purpose') ?? ''} ${headers.get('purpose') ?? ''} ${headers.get('x-purpose') ?? ''} ${headers.get('x-moz') ?? ''}`.toLowerCase();
+	return purpose.includes('prefetch') || purpose.includes('preview');
 }
 
 /** ISO 3166-1 alpha-2 (or Cloudflare's 'T1' for Tor), else 'XX'. */
@@ -160,12 +166,83 @@ function cfProperty(request: Request, key: 'country' | 'colo' | 'verifiedBot'): 
 	return cf[key];
 }
 
+/** A cf string as-is (the waiting room normalises it), bounded so the RPC stays tiny. */
+function cfString(request: Request, key: 'country' | 'colo'): string {
+	const value = cfProperty(request, key);
+	return typeof value === 'string' ? value.slice(0, 8) : '';
+}
+
+/** Whether a request is a refresh poll rather than someone checking (`?poll=1`). */
+export function isRefreshPoll(request: Request): boolean {
+	const url = request.url;
+	const query = url.indexOf('?');
+	if (query < 0) return false;
+	// Skip parsing the URL when "poll" can't be in the query (not even percent-encoded).
+	const rest = url.slice(query);
+	if (!rest.includes('poll') && !rest.includes('%')) return false;
+	try {
+		return new URL(url).searchParams.has('poll');
+	} catch {
+		return false;
+	}
+}
+
 // ── Recording ────────────────────────────────────────────────────────────────
 
-/** How long checks collect in memory before one D1 batch writes them (well under waitUntil's 30s). */
-export const CHECK_FLUSH_DELAY_MS = 15_000;
+/** One check, as the Worker sends it to the WaitingRoom (which validates it again). */
+export interface CheckEvent {
+	/** London day, 'YYYY-MM-DD'. */
+	day: string;
+	/** London hour of day, 0-23. */
+	hour: number;
+	/** cf.country as Cloudflare sent it; the waiting room normalises it. */
+	country: string;
+	/** cf.colo as Cloudflare sent it; the waiting room normalises it. */
+	colo: string;
+}
 
-interface Tallies {
+/** The check a request makes, or null if it doesn't count (bots, prefetches, refresh polls). */
+export function checkFromRequest(request: Request, now: Date = new Date()): CheckEvent | null {
+	if (isBot(request.headers.get('user-agent'))) return null;
+	if (cfProperty(request, 'verifiedBot') === true) return null;
+	if (isPrefetch(request.headers)) return null;
+	// Refresh polls (embeds, the service worker) aren't someone checking.
+	if (isRefreshPoll(request)) return null;
+	return { day: londonDate(now), hour: londonHour(now), country: cfString(request, 'country'), colo: cfString(request, 'colo') };
+}
+
+/**
+ * Count one "check" of the answer. The root middleware passes the result to waitUntil after
+ * the route has answered. No awaits: it decides whether the request counts and fires one RPC
+ * at the WaitingRoom, which does the tallying and the D1 writes on its own CPU budget. Never
+ * rejects.
+ */
+export function recordCheck(env: Env, request: Request): Promise<void> {
+	try {
+		const check = checkFromRequest(request);
+		if (!check) return Promise.resolve();
+		return waitingRoom(env)
+			.recordCheck(check)
+			.catch((err: unknown) => {
+				console.error('recordCheck failed:', err);
+			});
+	} catch (err) {
+		console.error('recordCheck failed:', err);
+		return Promise.resolve();
+	}
+}
+
+/** A check from the wire, validated and normalised; null if it isn't one. */
+export function parseCheckEvent(input: unknown): CheckEvent | null {
+	if (typeof input !== 'object' || input === null) return null;
+	const { day, hour, country, colo } = input as Partial<Record<keyof CheckEvent, unknown>>;
+	if (!isYmd(day)) return null;
+	if (typeof hour !== 'number' || !Number.isInteger(hour) || hour < 0 || hour > 23) return null;
+	return { day, hour, country: normaliseCountry(country), colo: normaliseColo(colo) };
+}
+
+/** Checks counted but not yet written to D1, per dimension D1 keeps. */
+export interface CheckTallies {
 	total: number;
 	daily: Map<string, number>;
 	hourly: Map<number, number>;
@@ -173,131 +250,73 @@ interface Tallies {
 	colo: Map<string, number>;
 }
 
-const emptyTallies = (): Tallies => ({ total: 0, daily: new Map(), hourly: new Map(), country: new Map(), colo: new Map() });
+export const emptyCheckTallies = (): CheckTallies => ({ total: 0, daily: new Map(), hourly: new Map(), country: new Map(), colo: new Map() });
 const bump = <K>(map: Map<K, number>, key: K, n: number) => map.set(key, (map.get(key) ?? 0) + n);
 
-/** Checks counted in this isolate but not yet written to D1. */
-let pending = emptyTallies();
-let flushScheduled = false;
-
-/** Whether a request is a refresh poll rather than someone checking (`?poll=1`). */
-export function isRefreshPoll(request: Request): boolean {
-	try {
-		return new URL(request.url).searchParams.has('poll');
-	} catch {
-		return false;
-	}
+/** Add one (normalised) check to a tally. */
+export function tallyCheck(tallies: CheckTallies, check: CheckEvent): void {
+	bump(tallies.daily, check.day, 1);
+	bump(tallies.hourly, check.hour, 1);
+	bump(tallies.country, check.country, 1);
+	bump(tallies.colo, check.colo, 1);
+	tallies.total += 1;
 }
 
-/**
- * Count one "check" of the answer. Called via waitUntil by the root middleware, after the
- * route has answered. Never throws. The request that schedules the next flush keeps its
- * waitUntil open until the flush has run; the rest return straight away.
- */
-export async function recordCheck(env: Env, request: Request): Promise<void> {
-	try {
-		if (isBot(request.headers.get('user-agent'))) return;
-		if (cfProperty(request, 'verifiedBot') === true) return;
-		if (isPrefetch(request.headers)) return;
-		// Refresh polls (embeds, the service worker) aren't someone checking.
-		if (isRefreshPoll(request)) return;
-
-		const now = new Date();
-		bump(pending.daily, londonDate(now), 1);
-		bump(pending.hourly, londonHour(now), 1);
-		bump(pending.country, normaliseCountry(cfProperty(request, 'country')), 1);
-		bump(pending.colo, normaliseColo(cfProperty(request, 'colo')), 1);
-		pending.total += 1;
-
-		if (flushScheduled) return;
-		flushScheduled = true;
-		try {
-			await new Promise<void>((resolve) => setTimeout(resolve, CHECK_FLUSH_DELAY_MS));
-		} finally {
-			flushScheduled = false;
-		}
-		if ((await flushChecks(env)) > 0) await sendChecks(env);
-	} catch (err) {
-		console.error('recordCheck failed:', err);
-	}
+/** Add every count in `from` to `into` (a failed write going back in the queue). */
+export function mergeCheckTallies(into: CheckTallies, from: CheckTallies): void {
+	for (const [k, n] of from.daily) bump(into.daily, k, n);
+	for (const [k, n] of from.hourly) bump(into.hourly, k, n);
+	for (const [k, n] of from.country) bump(into.country, k, n);
+	for (const [k, n] of from.colo) bump(into.colo, k, n);
+	into.total += from.total;
 }
 
-/**
- * Write the pending tallies to D1 in one batch (one upsert per distinct key) and clear them.
- * Returns how many checks were written. If the batch fails, the counts go back into the
- * tally for the next flush rather than being dropped. Never throws.
- */
-export async function flushChecks(env: Env): Promise<number> {
-	const batch = pending;
-	pending = emptyTallies();
-	if (batch.total === 0) return 0;
+/** The D1 upserts for a tally: one per distinct key, adding to whatever is there. */
+export function checkUpserts(tallies: CheckTallies): Array<{ sql: string; args: [string | number, number] }> {
 	const upsert = (table: string, column: string) =>
 		`INSERT INTO ${table} (${column}, count) VALUES (?, ?) ON CONFLICT (${column}) DO UPDATE SET count = count + excluded.count`;
-	const statements = [
-		...[...batch.daily].map(([day, n]) => env.DB.prepare(upsert('checks_daily', 'day')).bind(day, n)),
-		...[...batch.hourly].map(([hour, n]) => env.DB.prepare(upsert('checks_hourly', 'hour')).bind(hour, n)),
-		...[...batch.country].map(([country, n]) => env.DB.prepare(upsert('checks_country', 'country')).bind(country, n)),
-		...[...batch.colo].map(([colo, n]) => env.DB.prepare(upsert('checks_colo', 'colo')).bind(colo, n)),
+	const rows = <K extends string | number>(map: Map<K, number>, sql: string) =>
+		[...map].map(([key, n]) => ({ sql, args: [key, n] as [string | number, number] }));
+	return [
+		...rows(tallies.daily, upsert('checks_daily', 'day')),
+		...rows(tallies.hourly, upsert('checks_hourly', 'hour')),
+		...rows(tallies.country, upsert('checks_country', 'country')),
+		...rows(tallies.colo, upsert('checks_colo', 'colo')),
 	];
-	try {
-		await env.DB.batch(statements);
-	} catch (err) {
-		console.error('flushChecks failed; keeping the counts for the next flush:', err);
-		for (const [k, n] of batch.daily) bump(pending.daily, k, n);
-		for (const [k, n] of batch.hourly) bump(pending.hourly, k, n);
-		for (const [k, n] of batch.country) bump(pending.country, k, n);
-		for (const [k, n] of batch.colo) bump(pending.colo, k, n);
-		pending.total += batch.total;
-		return 0;
-	}
-	// The cached D1 total is now behind by exactly what was just written.
-	if (totalCache) totalCache.value += batch.total;
-	return batch.total;
 }
 
-/** Checks counted in this isolate and not yet in D1 (for tests and the live total). */
-export function pendingCheckCount(): number {
-	return pending.total;
-}
-
-async function sendChecks(env: Env): Promise<void> {
-	try {
-		const total = await readCheckTotal(env);
-		totalCache = { at: Date.now(), value: total };
-		await broadcast(env, { type: 'checks', checks: total + pending.total });
-	} catch (err) {
-		console.error('checks broadcast failed:', err);
-	}
-}
+/** Every check ever written to D1. */
+export const CHECK_TOTAL_SQL = 'SELECT COALESCE(SUM(count), 0) AS total FROM checks_daily';
 
 // ── Reading ──────────────────────────────────────────────────────────────────
 
 const TOTAL_CACHE_MS = 2_000;
 let totalCache: { at: number; value: number } | null = null;
 
-async function readCheckTotal(env: Env): Promise<number> {
-	const row = await env.DB.prepare('SELECT COALESCE(SUM(count), 0) AS total FROM checks_daily').first<{ total: number }>();
-	return Number(row?.total ?? 0) || 0;
-}
-
 /**
- * Total checks ever, including this isolate's not-yet-flushed ones. The D1 part is cached
- * for ~2s per isolate. Doesn't throw: if D1 is having a moment it returns the last known
- * total (or 0).
+ * Total checks ever, including the ones the waiting room hasn't written to D1 yet: one RPC,
+ * cached for ~2 s per isolate. Doesn't throw: if the waiting room is unreachable it falls back
+ * to D1's total (without the last few seconds), then to the last known total (or 0).
  */
 export async function getCheckTotal(env: Env): Promise<number> {
 	const cached = totalCache;
-	if (cached && Date.now() - cached.at < TOTAL_CACHE_MS) return cached.value + pending.total;
+	if (cached && Date.now() - cached.at < TOTAL_CACHE_MS) return cached.value;
+	let value: number;
 	try {
-		const value = await readCheckTotal(env);
-		// Never go backwards within an isolate (a local increment may be ahead of a replica).
-		const best = Math.max(value, cached?.value ?? 0);
-		totalCache = { at: Date.now(), value: best };
-		return best + pending.total;
+		value = Number(await waitingRoom(env).checkTotal()) || 0;
 	} catch (err) {
-		console.error('getCheckTotal failed:', err);
-		return (cached?.value ?? 0) + pending.total;
+		console.error('getCheckTotal: waiting room unavailable, asking D1:', err);
+		try {
+			const row = await env.DB.prepare(CHECK_TOTAL_SQL).first<{ total: number }>();
+			// D1 lags the waiting room by a few seconds: never go backwards within an isolate.
+			value = Math.max(Number(row?.total ?? 0) || 0, cached?.value ?? 0);
+		} catch (err2) {
+			console.error('getCheckTotal failed:', err2);
+			return cached?.value ?? 0;
+		}
 	}
+	totalCache = { at: Date.now(), value };
+	return value;
 }
 
 // ── Analytics (for /stats) ───────────────────────────────────────────────────

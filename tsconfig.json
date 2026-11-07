@@ -10,7 +10,8 @@
     "isolatedModules": true,
     "resolveJsonModule": true,
     "noFallthroughCasesInSwitch": true,
-    "forceConsistentCasingInFileNames": true
+    "forceConsistentCasingInFileNames": true,
+    "types": ["node"]
   },
   "include": ["worker-configuration.d.ts", "src/**/*.ts", "test/**/*.ts"]
 }

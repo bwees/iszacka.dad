@@ -5,6 +5,7 @@ import {
 	classifyEmailError,
 	cleanHeaderValue,
 	deliverEmail,
+	deliverEmailBatch,
 	renderAlreadySubscribedEmail,
 	renderAutoReply,
 	renderConfirmationEmail,
@@ -14,9 +15,12 @@ import {
 	replySubject,
 	sendConfirmation,
 	sendEmail,
+	sendEmailBatch,
 	subscriberHeaders,
+	updateEmailRenderer,
 } from '../src/notify/email';
-import type { Frequency, Status, Update, UpdateKind } from '../src/types';
+import type { Frequency, Status, SubscriberRow, Update, UpdateKind } from '../src/types';
+import { sqliteD1 } from './email-announce-d1';
 
 const BASE = 'https://iszacka.dad';
 const TOKEN = 'tok_abcdefghijklmnopqrstuvwxyz012345';
@@ -392,5 +396,198 @@ describe('sendEmail (Resend)', () => {
 		const fetch = fakeFetch(okResponse('never'));
 		expect(await sendEmail(env, msg, { sleep, fetch })).toMatchObject({ ok: false, transient: true, code: 'daily_quota_exceeded' });
 		expect(fetch).not.toHaveBeenCalled();
+	});
+});
+
+describe('updateEmailRenderer (render once per frequency)', () => {
+	const tokens = [TOKEN, 'tok-AZaz09_-xxxxxxxxxxxxxxxx', "odd'token&<x>\"y\" é/?#"];
+
+	it.each(VARIANTS)('%s/%s is byte-for-byte what renderUpdateEmail gives each subscriber', async (kind, status) => {
+		const u = update(kind, status, { body: 'A note & a <b>half</b>.' });
+		const render = updateEmailRenderer(BASE, u);
+		for (const frequency of ['big', 'daily'] as Frequency[]) {
+			for (const token of tokens) {
+				expect(await render({ token, frequency })).toEqual(await renderUpdateEmail({ base: BASE, update: u, token, frequency }));
+			}
+		}
+	});
+
+	it('still renders correctly if the update text happens to contain the placeholder', async () => {
+		const u = update('system', 'no', { body: 'izadTokenSlot7f3a9c2e' });
+		const email = await updateEmailRenderer(BASE, u)({ token: TOKEN, frequency: 'big' });
+		expect(email).toEqual(await renderUpdateEmail({ base: BASE, update: u, token: TOKEN, frequency: 'big' }));
+	});
+
+	it('no longer claims a headless browser photographs anything', async () => {
+		const email = await renderUpdateEmail({ base: BASE, update: update('status', 'yes'), token: TOKEN, frequency: 'big' });
+		expect(email.text).not.toMatch(/headless|photograph/i);
+	});
+});
+
+describe('sendEmailBatch (Resend /emails/batch)', () => {
+	/** A D1 stand-in: email_sends reads `sentToday`; writes are logged with their binds. */
+	function fakeEnv(sentToday = 0) {
+		const writes: Array<{ sql: string; binds: unknown[] }> = [];
+		const reads = { n: 0 };
+		const DB = {
+			prepare(sql: string) {
+				return {
+					bind(...binds: unknown[]) {
+						return {
+							async first() {
+								reads.n++;
+								return { n: sentToday };
+							},
+							async run() {
+								writes.push({ sql, binds });
+								return { meta: { changes: 1 } };
+							},
+						};
+					},
+				};
+			},
+		};
+		const env = {
+			RESEND_API_KEY: 're_test_key',
+			RESEND_API_BASE: 'https://resend.test',
+			EMAIL_FROM: 'stork@iszacka.dad',
+			EMAIL_FROM_NAME: 'The Stork',
+			EMAIL_DAILY_LIMIT: '90',
+			DB,
+		} as unknown as Parameters<typeof sendEmailBatch>[0];
+		return { env, writes, reads };
+	}
+	const msgs = (n: number) =>
+		Array.from({ length: n }, (_, i) => ({ to: `p${i}@example.com`, subject: 'Hi', html: '<p>Hi</p>', text: 'Hi', idempotencyKey: `update:1:${i}` }));
+	const accepted = async (_url: string | URL | Request, init?: RequestInit) =>
+		Response.json({ data: (JSON.parse(String(init?.body)) as unknown[]).map((_, i) => ({ id: `m${i}` })) });
+	const sleep = vi.fn(async () => {});
+
+	it('sends the whole batch in one permissive request, and counts it with one write', async () => {
+		const { env, writes, reads } = fakeEnv(3);
+		const fetch = vi.fn(accepted);
+		const results = await sendEmailBatch(env, msgs(3), { fetch, sleep, idempotencyKey: 'update:1' });
+		expect(results.map((r) => r.messageId)).toEqual(['m0', 'm1', 'm2']);
+		expect(fetch).toHaveBeenCalledTimes(1);
+		const [url, init] = fetch.mock.calls[0] ?? [];
+		expect(url).toBe('https://resend.test/emails/batch');
+		const headers = new Headers(init?.headers);
+		expect(headers.get('user-agent')).toMatch(/iszacka\.dad/);
+		expect(headers.get('x-batch-validation')).toBe('permissive');
+		expect(headers.get('idempotency-key')).toMatch(/^[0-9a-f]{64}$/);
+		const body = JSON.parse(String(init?.body)) as Array<Record<string, unknown>>;
+		expect(body).toHaveLength(3);
+		expect(body[0]).toMatchObject({ from: '"The Stork" <stork@iszacka.dad>', to: 'p0@example.com', subject: 'Hi' });
+		expect(reads.n).toBe(1);
+		expect(writes).toEqual([{ sql: expect.stringContaining('email_sends'), binds: [expect.any(String), 3] }]);
+	});
+
+	it('keys idempotency by the exact set of emails', async () => {
+		const keyFor = async (batch: ReturnType<typeof msgs>, key = 'update:1') => {
+			const fetch = vi.fn(accepted);
+			await sendEmailBatch(fakeEnv().env, batch, { fetch, sleep, idempotencyKey: key });
+			return new Headers(fetch.mock.calls[0]?.[1]?.headers).get('idempotency-key');
+		};
+		const a = await keyFor(msgs(3));
+		expect(await keyFor(msgs(3))).toBe(a);
+		expect(await keyFor(msgs(2))).not.toBe(a);
+		expect(await keyFor(msgs(3), 'update:2')).not.toBe(a);
+	});
+
+	it('maps per-email rejections by index, and pairs the ids with the rest', async () => {
+		const { env, writes } = fakeEnv();
+		const fetch = vi.fn(async () =>
+			Response.json({
+				data: [{ id: 'a' }, { id: 'c' }],
+				errors: [{ index: 1, message: 'Invalid `to` field. The email address needs to follow the `email@example.com` format.' }],
+			}),
+		);
+		const results = await sendEmailBatch(env, msgs(3), { fetch, sleep });
+		expect(results[0]).toMatchObject({ ok: true, messageId: 'a' });
+		expect(results[1]).toMatchObject({ ok: false, transient: false });
+		expect(results[2]).toMatchObject({ ok: true, messageId: 'c' });
+		expect(writes[0]?.binds[1]).toBe(2);
+	});
+
+	it('treats a suppressed recipient as gone', async () => {
+		const fetch = vi.fn(async () => Response.json({ data: [], errors: [{ index: 0, message: 'recipient_suppressed: on the suppression list' }] }));
+		expect((await sendEmailBatch(fakeEnv().env, msgs(1), { fetch, sleep }))[0]).toMatchObject({ ok: false, gone: true, code: 'recipient_suppressed' });
+	});
+
+	it('sends only what the quota allows; the rest come back unsent with a quota code', async () => {
+		const { env } = fakeEnv(85);
+		const fetch = vi.fn(accepted);
+		const results = await sendEmailBatch(env, msgs(8), { fetch, sleep });
+		expect((JSON.parse(String(fetch.mock.calls[0]?.[1]?.body)) as unknown[]).length).toBe(5);
+		expect(results.filter((r) => r.ok)).toHaveLength(5);
+		expect(results.slice(5).map((r) => r.code)).toEqual(['daily_quota_exceeded', 'daily_quota_exceeded', 'daily_quota_exceeded']);
+
+		const reserved = await sendEmailBatch(fakeEnv(75).env, msgs(8), { fetch, sleep, reserve: 10 });
+		expect(reserved.filter((r) => r.ok)).toHaveLength(5);
+		expect(reserved[7]?.code).toBe('quota_reserve');
+
+		const none = vi.fn(accepted);
+		expect((await sendEmailBatch(fakeEnv(90).env, msgs(2), { fetch: none, sleep })).every((r) => r.code === 'daily_quota_exceeded')).toBe(true);
+		expect(none).not.toHaveBeenCalled();
+	});
+
+	it('retries a whole-batch rate limit once with the same key, but not Resend running out of quota', async () => {
+		const limited = vi
+			.fn(accepted)
+			.mockImplementationOnce(async () => Response.json({ name: 'rate_limit_exceeded', message: 'Too many requests' }, { status: 429 }));
+		const results = await sendEmailBatch(fakeEnv().env, msgs(2), { fetch: limited, sleep });
+		expect(results.every((r) => r.ok)).toBe(true);
+		expect(limited).toHaveBeenCalledTimes(2);
+		const keys = limited.mock.calls.map((c) => new Headers(c[1]?.headers).get('idempotency-key'));
+		expect(keys[0]).toBe(keys[1]);
+
+		const quota = vi.fn(async () => Response.json({ name: 'daily_quota_exceeded', message: 'quota' }, { status: 429 }));
+		const out = await sendEmailBatch(fakeEnv().env, msgs(2), { fetch: quota, sleep });
+		expect(quota).toHaveBeenCalledTimes(1);
+		expect(out.map((r) => r.code)).toEqual(['daily_quota_exceeded', 'daily_quota_exceeded']);
+	});
+
+	it('reports a persistent outage for every email as transient, without throwing or counting', async () => {
+		const { env, writes } = fakeEnv();
+		const fetch = vi.fn(async () => Response.json({ name: 'application_error', message: 'boom' }, { status: 500 }));
+		const results = await sendEmailBatch(env, msgs(2), { fetch, sleep });
+		expect(results).toEqual([
+			expect.objectContaining({ ok: false, transient: true, code: 'application_error' }),
+			expect.objectContaining({ ok: false, transient: true, code: 'application_error' }),
+		]);
+		expect(writes).toEqual([]);
+	});
+
+	it('fails cleanly without an API key, and splits anything over 100 emails', async () => {
+		const fetch = vi.fn(accepted);
+		const { env } = fakeEnv();
+		expect((await sendEmailBatch({ ...env, RESEND_API_KEY: undefined }, msgs(2), { fetch, sleep }))[0]).toMatchObject({ code: 'no_api_key' });
+		expect(fetch).not.toHaveBeenCalled();
+		const results = await sendEmailBatch({ ...env, EMAIL_DAILY_LIMIT: '1000' }, msgs(150), { fetch, sleep });
+		expect(results.filter((r) => r.ok)).toHaveLength(150);
+		expect(fetch.mock.calls.map((c) => (JSON.parse(String(c[1]?.body)) as unknown[]).length)).toEqual([100, 50]);
+	});
+});
+
+describe('deliverEmailBatch', () => {
+	it('renders per subscriber, sends one request and unsubscribes suppressed addresses', async () => {
+		const { D1, db } = sqliteD1();
+		const insert = db.prepare('INSERT INTO subscribers (email, frequency, token, created_at, confirmed_at) VALUES (?, ?, ?, ?, ?)');
+		insert.run('a@example.com', 'big', 'tok_aaaaaaaaaaaaaaaaaaaaaa', '2026-11-01', '2026-11-01');
+		insert.run('b@example.com', 'daily', 'tok_bbbbbbbbbbbbbbbbbbbbbb', '2026-11-01', '2026-11-01');
+		const subs = db.prepare('SELECT id, email, frequency, token, created_at, confirm_sent_at, confirmed_at, unsubscribed_at FROM subscribers').all() as unknown as SubscriberRow[];
+		const env = { DB: D1, SITE_URL: BASE, RESEND_API_KEY: 'k', EMAIL_FROM: 'stork@iszacka.dad', EMAIL_FROM_NAME: 'The Stork', EMAIL_DAILY_LIMIT: '90' } as unknown as Env;
+		const fetch = vi.fn(async () => Response.json({ data: [{ id: 'm1' }], errors: [{ index: 1, message: 'recipient_suppressed' }] }));
+
+		const u = update('status', 'yes', { id: 9 });
+		const results = await deliverEmailBatch(env, subs, u, { fetch });
+		expect(results[0]).toMatchObject({ ok: true, messageId: 'm1' });
+		expect(results[1]).toMatchObject({ ok: false, gone: true, detail: expect.stringContaining('(subscriber disabled)') });
+		const body = JSON.parse(String((fetch.mock.calls[0] as unknown as [string, RequestInit])[1].body)) as Array<{ html: string; headers: Record<string, string> }>;
+		expect(body[0]?.html).toBe((await renderUpdateEmail({ base: BASE, update: u, token: subs[0]!.token, frequency: 'big' })).html);
+		expect(body[1]?.html).toContain(`${BASE}/unsubscribe/${subs[1]!.token}`);
+		expect(body[1]?.headers['List-Unsubscribe']).toBe(`<${BASE}/unsubscribe/${subs[1]!.token}>`);
+		expect(db.prepare('SELECT email FROM subscribers WHERE unsubscribed_at IS NOT NULL').all()).toEqual([{ email: 'b@example.com' }]);
+		expect(db.prepare('SELECT n FROM email_sends').get()).toEqual({ n: 1 });
 	});
 });

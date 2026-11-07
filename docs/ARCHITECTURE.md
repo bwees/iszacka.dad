@@ -24,6 +24,7 @@ Cloudflare Worker (TypeScript, [Hono](https://hono.dev) router, server-rendered 
   `turnstileWidget(c.env)` inside the form and pass `turnstile: true` to `renderPage`.
 - **Time zone:** Europe/London for "days", using `src/lib/time.ts`. Store ISO UTC.
 - **Delivery functions never throw.** They return `DeliveryResult`.
+- **10 ms of CPU.** Production runs on Workers Free: see [CPU budget](#cpu-budget-workers-free).
 
 ## Foundation (read-only for agents)
 
@@ -35,23 +36,28 @@ Key APIs:
 
 | Module | Exports |
 |---|---|
-| `lib/state.ts` | `getState(env)`, `setStatus(env, status, {note})` (history + ledger + update + broadcast + workflow), `setDueDate(env, ymd\|null)`, `getSetting/setSetting/getOrCreateSetting(env, key, …)`, `getStatusHistory(env)` |
-| `lib/updates.ts` | `createUpdate(env, {kind,title,body,status,audience})` (stores, broadcasts, starts `AnnounceWorkflow` unless audience `none`), `startAnnouncement(env, id, attempt)`, `getUpdate`, `listUpdates(env,{limit,beforeId,kinds})`, `markNotified` |
-| `lib/live.ts` | `broadcast(env, LiveMessage)`, `liveStats(env)`, `waitingRoom(env)` |
-| `lib/security.ts` | `randomToken`, `sha256Hex`, `timingSafeEqual`, `hashIdentifier(env, value)` (salted; use for IPs/emails), `clientIp(c)`, `clientKey(c)` (rate-limit key: IPv6 → /64), `dnsAnswerName(env)` is in `lib/site.ts`, `wantsJson(c)`, `isValidEmail`, `allow(limiter, key)`, `turnstileEnabled/turnstileWidget/verifyTurnstile`, `base64UrlEncode/Decode` |
+| `lib/state.ts` | `getState(env)`, `setStatus(env, status, {note})` (one D1 batch: settings + history + update; then starts `AnnounceWorkflow` with `publish`, which broadcasts, signs the ledger and updates DNS), `setDueDate(env, ymd\|null)`, `getSetting/setSetting/getOrCreateSetting(env, key, …)`, `getStatusHistory(env)` |
+| `lib/updates.ts` | `createUpdate(env, {kind,title,body,status,audience})` (stores, starts `AnnounceWorkflow` with `publish`, whose first step broadcasts it; broadcasts inline only for audience `none` or if the workflow can't start), `insertUpdateStatement`, `launchAnnouncement`, `startAnnouncement(env, id, attempt)` (admin re-runs: no re-broadcast), `getUpdate`, `listUpdates(env,{limit,beforeId,kinds})`, `markNotified` |
+| `lib/live.ts` | `broadcast(env, LiveMessage)`, `liveSnapshot(env)` (viewers, vibes, checks and reload nonce in one RPC), `liveStats(env)`, `waitingRoom(env)` |
+| `lib/security.ts` | `randomToken`, `sha256Hex`, `timingSafeEqual`, `hashIdentifier(env, value)` (salted, salt cached per isolate; use for IPs/emails), `clientIp(c)`, `clientKey(c)` (rate-limit key: IPv6 → /64), `dnsAnswerName(env)` is in `lib/site.ts`, `wantsJson(c)`, `isValidEmail`, `allow(limiter, key)`, `turnstileEnabled/turnstileWidget/verifyTurnstile`, `base64UrlEncode/Decode` |
 | `lib/deliveries.ts` | `deliveredTargets(env, updateId, channel, ids)`, `recordDelivery(...)`, `deliverySummary(env, updateId)` |
 | `lib/site.ts` | `SITE_NAME`, `DAD`, `PARENTS`, `DOMAIN`, `siteUrl(env)`, `STATUS_COPY[status]` (`word`, `short`, `headline`, `sentence`, `emoji`, `header`, `ledgerNote`) |
-| `lib/time.ts` | `TZ`, `nowIso`, `londonDate`, `londonHour`, `isYmd`, `daysBetween`, `addDays`, `formatLondon`, `formatLondonDate` |
+| `lib/time.ts` | `TZ`, `nowIso`, `londonDate`, `londonHour`, `isYmd`, `daysBetween`, `addDays`, `formatLondon`, `formatLondonDate` (all without Intl for the formats in use), `formatNumber` (en-GB grouping without Intl), `formatWeekday`, `formatDayMonth`, `formatWeekdayDayMonth`, `dateTimeFormat`/`numberFormat` (memoised Intl, for anything else) |
 | `lib/layout.ts` | `renderPage(c, {title, description, body, path, head, scripts, turnstile, noindex, status, bodyClass, bare})` (owned by frontend; the signature is a contract) |
 
-`c.get('state')` holds the `SiteState` for the current request. Root middleware also counts checks,
+`c.get('state')` holds the `SiteState` for the current request, except on the routes in
+`STATELESS_PATHS` (`src/index.ts`: `/api/resend/webhook`, `/api/push/key`, `/api/push/subscribe`,
+`/api/push/unsubscribe`, `/robots.txt`, `/.well-known/security.txt`) and WebSocket upgrades to
+`/ws`, which skip the state read and get no `X-Is-Zack-A-Dad` header; call `getState(env)` there if
+you need it. Root middleware also counts checks (one fire-and-forget RPC to the WaitingRoom),
 serves curl ASCII on `/`, redirects `www.`, and sets the `X-Is-Zack-A-Dad`, `Server-Timing`, CSP and
 security headers. A route can override a default header by setting it first. `/embed` needs
 `frame-ancestors *`.
 
-Bindings (`Env`): `DB` (D1), `WAITING_ROOM` (DO), `ANNOUNCE` (Workflow), `BROWSER` (Browser
-Rendering), `CF_VERSION` (version metadata), `RL_FORMS` 10/min, `RL_API` 120/min, `RL_EMAIL` 5/min,
-`ASSETS`. Vars: `ENVIRONMENT`, `SITE_URL`, `EMAIL_FROM`, `EMAIL_FROM_NAME`, `EMAIL_REPLY_FROM`,
+Bindings (`Env`): `DB` (D1), `WAITING_ROOM` (DO), `ANNOUNCE` (Workflow `iszacka-dad-announce`),
+`INBOUND` (Workflow `iszacka-dad-inbound`), `DAILY` (Workflow `iszacka-dad-daily`), `CF_VERSION`
+(version metadata), `RL_FORMS` 10/min, `RL_API` 120/min, `RL_EMAIL` 5/min, `ASSETS`. Previews
+suffix the Workflow names with `-preview`. Vars: `ENVIRONMENT`, `SITE_URL`, `EMAIL_FROM`, `EMAIL_FROM_NAME`, `EMAIL_REPLY_FROM`,
 `EMAIL_DAILY_LIMIT`, `DNS_RECORD_NAME`, `ZONE_NAME` (preview also has Turnstile's test keys and an
 admin password as vars). Secrets: `ADMIN_PASSWORD`, `RESEND_API_KEY?`, `RESEND_WEBHOOK_SECRET?`,
 `TURNSTILE_SITE_KEY?`, `TURNSTILE_SECRET_KEY?`, `DNS_API_TOKEN?`, `DNS_ZONE_ID?`. The deploy workflow
@@ -61,25 +67,32 @@ through the Resend API, both ways (see "Email (Resend)" below); there is no emai
 
 ## Status model & notification flow
 
-`no` → `soon` (labour started) → `yes`. Admin flips it. `setStatus` writes settings + `status_history`,
-calls `appendLedger`, broadcasts `{type:'state'}`, and creates an update with kind `status` and
-audience `all`. `createUpdate` broadcasts `{type:'update'}` and starts `AnnounceWorkflow` with
-`{updateId}`.
+`no` → `soon` (labour started) → `yes`. Admin flips it. `setStatus` writes the settings, the
+`status_history` row and an update (kind `status`, audience `all`) in one D1 batch, then starts
+`AnnounceWorkflow` with `{updateId, publish: true, ledgerNote}` and returns. `createUpdate` does the
+same for other updates (`{updateId, publish: true}`). If the workflow can't be started, both
+broadcast inline so open browsers still flip. Workflow instance ids are `update-<id>` (admin
+re-runs: `update-<id>-r<n>`, without `publish`).
 
-`AnnounceWorkflow` (email agent):
+`AnnounceWorkflow` (`src/workflows/announce.ts`), one `step.do` per item:
 1. Load the update.
-2. For `status` updates, wait a 60s grace period, then skip notifying if the status has changed
-   again (undo window). The reason is recorded in settings `superseded:<id>` so `/updates/:id`
-   can say the update was never announced.
-3. Push, then webhooks, each in its own `step.do` per batch of 25 by id cursor. Each batch
-   filters out recipients already in `deliveries` and records every attempt.
-4. On `status` updates, `updateAnswerRecord` (DNS, from fresh state).
-5. `renderOgImage` (OG).
-6. Email, last, because it's the only channel with a quota. When the day's quota runs out
-   mid-batch, real news (audience `all`) `step.sleepUntil`s the next 00:00 UTC, checks the update
-   isn't stale, and carries on from the same cursor. Daily posts stop at `DAILY_EMAIL_RESERVE`
-   and are dropped rather than sent tomorrow. Email waiting on the quota never delays push,
-   webhooks or DNS.
+2. Only when `params.publish` is set (so admin re-runs never repeat them): broadcast the fresh
+   state from D1 (status updates), broadcast `{type:'update'}`, and append the change to the Dad
+   Ledger (skipped if a newer status update exists or the ledger head already shows this status,
+   so retries and quick double flips stay in order).
+3. Status updates: write the DNS TXT answer record (`updateAnswerRecord`) from fresh state.
+4. Status updates: wait a 60s grace period, then skip notifying if the status has changed
+   again or was flipped back to what the world was last told (undo window; only email, push and
+   webhook deliveries count as "told"). The reason is recorded in settings `superseded:<id>` so
+   `/updates/:id` can say the update was never announced.
+5. Push, then webhooks, 10 targets per step by id cursor (at most 6 in flight, so at most 20
+   subrequests a step). Each batch filters out recipients already in `deliveries` and records
+   every attempt in one D1 batch.
+6. Email, last, because it's the only channel with a quota: 20 per step in one request to Resend's
+   `/emails/batch`. When the day's quota runs out mid-batch, real news (audience `all`)
+   `step.sleepUntil`s the next 00:00 UTC, checks the update isn't stale, and carries on from the
+   same cursor. Daily posts stop at `DAILY_EMAIL_RESERVE` and are dropped rather than sent
+   tomorrow. Email waiting on the quota never delays push, webhooks or DNS.
 7. `markNotified`.
 
 Audience mapping:
@@ -90,24 +103,30 @@ Audience mapping:
 | `daily` | `daily` subscribers only | none | `daily` hooks only |
 | `none` | no-one | no-one | no-one |
 
-Daily cron (09:00 UTC, email agent) creates a kind `daily` update with audience `daily`:
+Daily cron (09:00 UTC, `src/cron.ts`) only starts `DailyWorkflow` (`src/workflows/daily.ts`) with
+id `daily-<London date>`, so a second trigger on the same day finds it already there. Its steps,
+each retried on its own (one failing never stops the others; the instance errors at the end):
 
-- Before `yes`: "Day N: still no." with due/overdue info.
-- After `yes`: "Dad day N" for 7 days, then a final "daily service concluded" post, then stops.
-
-It also purges unconfirmed subscribers older than 7 days, unsubscribed ones after 30 days, and
-`resend_events` rows older than 30 days. If the email quota is down to its last 10
-(`DAILY_EMAIL_RESERVE`), it skips the day's post rather than spend the reserve kept for real news.
+1. **Post the daily update** (kind `daily`, audience `daily`, which starts its own
+   `AnnounceWorkflow`): before `yes`, "Day N: still no." with due/overdue info; after `yes`, "Dad
+   day N" for 7 days, then a final "daily service concluded" post, then nothing. Skipped if it's
+   already out today, if the London day is over, or if the email quota is down to its last 10
+   (`DAILY_EMAIL_RESERVE`), kept for real news.
+2. **Sync the DNS answer record.**
+3. **Purge subscribers**: unconfirmed ones older than 7 days, unsubscribed ones after 30 days.
+4. **Purge `resend_events`** rows older than 30 days.
 
 ## Email (Resend)
 
 All email goes through [Resend](https://resend.com) with `RESEND_API_KEY`; with no key, every send
 fails cleanly (`no_api_key`) and nothing else breaks.
 
-- **Sending** (`src/notify/email.ts`): `sendEmail()` posts to `POST /emails`, one email per call, with
-  an `Idempotency-Key` per logical send (update + subscriber, the inbound email's id, or a random
-  key for one-offs) and a `User-Agent` (Resend
-  refuses requests without one). From `EMAIL_FROM_NAME <EMAIL_FROM>`; subscriber emails carry
+- **Sending** (`src/notify/email.ts`): `sendEmail()` posts one email to `POST /emails` (confirmations,
+  replies, test emails); announcements use `sendEmailBatch()`/`deliverEmailBatch()`, one
+  `POST /emails/batch` (`x-batch-validation: permissive`) per step, rendered once per frequency.
+  Every request carries an `Idempotency-Key` per logical send (update + subscribers, the inbound
+  email's id, or a random key for one-offs) and a `User-Agent` (Resend refuses requests without
+  one). From `EMAIL_FROM_NAME <EMAIL_FROM>`; subscriber emails carry
   `List-Unsubscribe` + `List-Unsubscribe-Post` (RFC 8058 one-click). Rate limits, 409s and 5xx
   are retried once in-process; validation errors are permanent; suppressed recipients are
   unsubscribed.
@@ -119,35 +138,44 @@ fails cleanly (`no_api_key`) and nothing else breaks.
   and inbound mail is recorded but not replied to.
 - **Receiving**: Resend receives `*@iszacka.dad` (the apex MX record points at Resend) and posts an
   `email.received` event to `POST /api/resend/webhook` (`src/routes/resend-webhook.ts`). The route
-  verifies the Svix signature with `RESEND_WEBHOOK_SECRET` (503 if unset, 401 if wrong or older
-  than 5 minutes), records the `svix-id` in `resend_events` (`migrations/0011_resend.sql`) so a
-  retried delivery is acknowledged with `{duplicate: true}` but never handled twice, answers 200
-  quickly and does the rest of the work in `waitUntil`:
-  - `email.received`: fetch the message from `GET /emails/receiving/{id}` *before* answering
-    (8-second timeout; Svix waits 15). If that fails transiently (429, 5xx, network error,
-    timeout), the `svix-id` row is deleted again and the route answers 503, so Resend redelivers
-    on its retry schedule (5s, 5m, 30m, ...) and the redelivery is handled rather than taken for
-    a duplicate. A permanent failure (404 or other 4xx, no `email_id`, no `RESEND_API_KEY`) keeps
-    the claim and answers 200. Once the claim is kept, the email is counted against the quota and
-    `handleInboundEmail` (`src/email-handler.ts`) runs in `waitUntil`. The sender is the
-    webhook's bare `data.from`, reduced to a lower-cased address, and only ever stored hashed
-    (`inbound_emails`). Loop protection skips bounces (null Return-Path, mailer-daemon),
-    auto-replies (`Auto-Submitted`, `Precedence`, `X-Auto-Response-Suppress`), mailing lists
-    (`List-Id`), no-reply senders and our own domain, and nothing is answered unless Resend's
-    `authentication` result says DKIM or DMARC passed (so spoofed senders can't use the
-    auto-reply to spam someone); replies are capped per sender by `RL_EMAIL` and 20 a day. A subject containing
-    "guess" enters the baby pool (`parseGuessText` → `submitGuess`); anything else gets the status
-    auto-reply. Replies come from `EMAIL_REPLY_FROM` with `In-Reply-To`/`References`.
+  does as little as possible, since the whole request gets 10 ms of CPU: it verifies the Svix
+  signature with `RESEND_WEBHOOK_SECRET` (503 if unset, 401 if wrong or older than 5 minutes),
+  claims the `svix-id` in `resend_events` (`migrations/0011_resend.sql`) so a retried delivery is
+  acknowledged with `{duplicate: true}` but never handled twice, and then:
+  - `email.received`: starts `InboundWorkflow` (`src/workflows/inbound.ts`) with id
+    `inbound-<svix-id>` (hashed if it isn't a valid instance id) and params `{emailId, from,
+    svixId}`, where `from` is the webhook's bare `data.from`, lower-cased. An instance that already
+    exists counts as started. If it can't be started, the claim is released and the route answers
+    503, so Resend redelivers. Instances keep their output for a day (`successRetention`). Steps:
+    - **fetch**: `GET /emails/receiving/{id}`, capped at 512 KiB before parsing, trimmed to what's
+      needed (HTML capped at 32,000 characters, text at 16,000, and the body kept only for
+      guesses). 429, 5xx, network errors and timeouts throw and the step retries for about 4
+      hours; a 4xx, a missing id or key, or an oversized email is permanent and the email is
+      recorded as ignored.
+    - **decide**: loop protection skips bounces (null Return-Path, mailer-daemon), auto-replies
+      (`Auto-Submitted`, `Precedence`, `X-Auto-Response-Suppress`), mailing lists (`List-Id`),
+      no-reply senders and our own domain; nothing is answered unless Resend's `authentication`
+      result says DKIM or DMARC passed (so spoofed senders can't use the auto-reply to spam
+      someone); then the quota, `RL_EMAIL` and 20 replies per sender a day. A subject containing
+      "guess" enters the baby pool (`parseGuessText`); anything else gets the status auto-reply.
+    - **guess** (guesses that parsed): `submitGuess`.
+    - **reply**: from `EMAIL_REPLY_FROM` with `In-Reply-To`/`References`, idempotency key
+      `reply:<emailId>`.
+    - **record**: one D1 batch writes `inbound_emails` (sender only ever stored hashed) and counts
+      the email against the quota, exactly once per instance thanks to an `inbound.recorded`
+      marker row in `resend_events` keyed by the instance id (purged with the rest after 30 days).
   - Pool names come only from an explicit `Name:` line. The display name on the sender's address
     is never used (it would end up on a public page); without a `Name:` line the entry is
     "Anonymous emailer", and the reply says so.
-  - `email.bounced` (permanent) and `email.complained`: unsubscribe the matching subscriber.
+  - `email.bounced` (permanent) and `email.complained`: unsubscribe the matching subscribers,
+    inline (at most 10 recipients).
   - Anything else: 200, ignored.
 
 ## Live protocol (`/ws` WebSocket, `/api/stream` SSE: realtime agent server, frontend client)
 
 Server → client `LiveMessage` (see `src/types.ts`): `hello` (on connect: state, viewers, vibes,
-checks, reloadNonce), `state`, `update`, `viewers`, `vibes` (`{vibes, emoji}`), `checks`, `reload`.
+checks, reloadNonce), `state`, `update`, `viewers`, `vibes` (`{vibes, emoji}`), `checks` (at most
+once a second), `reload`.
 Client → server: `{type:'vibe', emoji}` (rate-limited per socket), `{type:'ping'}`. The client
 reconnects with backoff. On `reload` with a nonce different from the one it booted with, it does
 `location.reload()`.
@@ -158,13 +186,13 @@ reconnects with backoff. On `reload` with a nonce different from the one it boot
 |---|---|---|
 | frontend | `src/lib/layout.ts`, `src/routes/pages.ts`, `src/lib/i18n.ts`, `src/lib/og-card.ts`, `public/styles.css`, `public/app.js`, `public/favicon-*.svg`, `public/icons/*`, `public/og/*`, `public/fonts/*`, `public/_headers`, `scripts/og-*`, `test/frontend-*` | design system; home; /updates; /everything; /og/card; 404; i18n; easter eggs |
 | feeds | `src/routes/feeds.ts`, `src/routes/api.ts`, `src/routes/mcp.ts`, `src/lib/feeds.ts`, `src/lib/ascii.ts`, `public/embed.js`, `test/feeds-*` | RSS/Atom/JSON/iCal, badge, embed, API + docs + OpenAPI, /api/dad 425/201, MCP, llms/humans/security/robots/sitemap, curl ASCII |
-| email | `src/routes/subscribe.ts`, `src/routes/resend-webhook.ts`, `src/notify/email.ts`, `src/workflows/announce.ts`, `src/cron.ts`, `src/email-handler.ts`, `src/lib/daily.ts`, `test/email-*`, `test/resend-*` | email updates via Resend (double opt-in, one-click unsubscribe, quota), daily NO, AnnounceWorkflow, cron, Resend webhook, inbound email auto-reply + email guesses |
+| email | `src/routes/subscribe.ts`, `src/routes/resend-webhook.ts`, `src/notify/email.ts`, `src/workflows/announce.ts`, `src/workflows/daily.ts`, `src/workflows/inbound.ts`, `src/cron.ts`, `src/email-handler.ts`, `src/lib/daily.ts`, `test/email-*`, `test/resend-*` | email updates via Resend (double opt-in, one-click unsubscribe, quota), daily NO, AnnounceWorkflow, DailyWorkflow, cron, Resend webhook, InboundWorkflow (inbound email auto-reply + email guesses) |
 | push | `src/routes/push.ts`, `src/routes/webhooks.ts`, `src/notify/push.ts`, `src/notify/webhooks.ts`, `src/notify/dns.ts`, `src/lib/vapid.ts`, `public/sw.js`, `public/push.js`, `public/manifest.webmanifest`, `public/offline.html`, `test/push-*` | web push, PWA + offline, webhooks, DNS TXT |
-| realtime | `src/do/waiting-room.ts`, `src/routes/live.ts`, `src/lib/counters.ts`, `test/realtime-*` | WebSockets, viewers, vibes, SSE, check counters, /stats |
+| realtime | `src/do/waiting-room.ts`, `src/do/waiting-room-protocol.ts`, `src/routes/live.ts`, `src/lib/counters.ts`, `test/realtime-*` | WebSockets, viewers, vibes, SSE, check counters (tallied in the WaitingRoom), /stats |
 | admin | `src/lib/admin.ts`, `src/routes/admin.ts`, `public/admin.js`, `test/admin-*` | admin auth + dashboard |
 | community | `src/lib/community.ts`, `src/routes/community.ts`, `test/community-*` | readiness checklist, congratulations wall, name suggestions (+ their /admin pages) |
 | fun | `src/lib/pool.ts`, `src/lib/forecast.ts`, `src/lib/fruit.ts`, `src/routes/fun.ts`, `test/fun-*` | baby pool, status page, certificate, fridge poster, forecast + fruit maths |
-| ledger | `src/lib/ledger.ts`, `src/lib/og.ts`, `src/routes/ledger.ts`, `test/ledger-*` | Dad Ledger, live OG image |
+| ledger | `src/lib/ledger.ts`, `src/lib/og.ts`, `src/routes/ledger.ts`, `test/ledger-*` | Dad Ledger (verification memoised per isolate), `/og.png` (serves the pre-rendered card) |
 | infra | `.github/**`, `scripts/setup-cloudflare.sh`, `scripts/smoke.sh`, `README.md`, `CLAUDE.md`, `docs/SETUP.md` | CI/CD, previews, one-time Cloudflare setup, smoke tests, docs |
 
 Reserved migration files, if you need schema additions (prefer not to): `0002_realtime`,
@@ -173,12 +201,19 @@ Reserved migration files, if you need schema additions (prefer not to): `0002_re
 
 ## Cross-module contracts (stubs exist; keep exported signatures exactly)
 
-- `lib/counters.ts`: `recordCheck(env, request)`, `getCheckTotal(env)`
-- `do/waiting-room.ts`: class `WaitingRoom` with `fetch()` (ws + sse), RPC `broadcast(msg)`, RPC `stats()`
+- `lib/counters.ts`: `recordCheck(env, request)` (synchronous filtering, then one fire-and-forget
+  `WaitingRoom.recordCheck` RPC; the room tallies in memory and writes D1 in batches),
+  `getCheckTotal(env)` (one `checkTotal()` RPC, cached 2 s per isolate; D1 if the room is down)
+- `do/waiting-room.ts`: class `WaitingRoom` with `fetch()` (ws + sse), RPCs `broadcast(msg)`, `stats()`,
+  `liveSnapshot()` (`{viewers, vibes, checks, reloadNonce}`), `recordCheck(check)`, `checkTotal()`
 - `lib/ledger.ts`: `appendLedger(env, {status, note})`, `getLedger(env, {limit})`, type `LedgerEntry`
-- `lib/og.ts`: `renderOgImage(env) → DeliveryResult`. Stores PNG in `og_images` key `current`. `/og.png`
-  serves it, falling back to static `/og/<status>.png`.
-- `lib/og-card.ts`: `renderOgCardHtml({state, checks, today}) → string` (self-contained HTML, 1200×630)
+- `lib/og.ts`: `ogCardPath(status)`, `ogVersionStatus(v)`. Nothing renders at request time: `/og.png`
+  serves `public/og/<status>.png` from `ASSETS` (the status from a valid `?v=<status>-<ms>`, cached
+  for a year; else the current status, 5 minutes). `scripts/og-render.ts --screenshot` regenerates
+  the PNGs from `lib/og-card.ts`; re-run it and commit them whenever the card or `STATUS_COPY`
+  changes.
+- `lib/og-card.ts`: `renderOgCardHtml({state, checks, today}) → string` (self-contained HTML, 1200×630,
+  used by `scripts/og-render.ts` and the `/og/card` preview)
 - `notify/push.ts`: `listPushTargets(env, afterId, limit)`, `deliverPush(env, sub, update)`
 - `notify/webhooks.ts`: `listWebhookTargets(env, audience, afterId, limit)`, `deliverWebhook(env, hook, update, state)`
 - `notify/dns.ts`: `updateAnswerRecord(env, state)`
@@ -201,7 +236,7 @@ Reserved migration files, if you need schema additions (prefer not to): `0002_re
 | realtime | `/ws`, `/api/stream`, `/api/live`, `/stats` |
 | email | `/subscribe` (GET/POST), `/confirm/:token`, `/unsubscribe/:token` (GET/POST one-click), `/api/resend/webhook` (POST, Svix-signed) |
 | push | `/api/push/key`, `/api/push/subscribe`, `/api/push/unsubscribe`, `/push.js`, `/sw.js`, `/manifest.webmanifest`, `/offline.html`, `/webhooks` (POST), `/webhooks/:token`, `/webhooks/:token/delete`, `/webhooks/:token/test` |
-| admin | `/admin`, `/admin/login`, `/admin/logout`, `/admin/status`, `/admin/due-date`, `/admin/reload`, `/admin/test-email`, `/admin/updates/:id/rerun`, `/admin/og/render`, `/admin/dns/sync` |
+| admin | `/admin`, `/admin/login`, `/admin/logout`, `/admin/status`, `/admin/due-date`, `/admin/reload`, `/admin/test-email`, `/admin/updates/:id/rerun`, `/admin/og/render` (retired: redirects to `/admin` with a notice, 410 for JSON), `/admin/dns/sync` |
 | community | `/ready`, `/wall`, `/names`, `/names/:id/vote`, `/admin/checklist`, `/admin/wall`, `/admin/names` |
 | fun | `/pool`, `/status`, `/certificate`, `/poster`, `/admin/pool` |
 | ledger | `/ledger`, `/api/ledger`, `/.well-known/dad-ledger.json`, `/og.png` |
@@ -230,6 +265,33 @@ advertise `ask@iszacka.dad`. To enter the pool by email, send a subject containi
   - `.empty` (empty state)
 - Admin pages: same kit, inside `renderAdminPage`.
 - `[data-status]` on `<html>`/`<body>` is `no`/`soon`/`yes` for state-specific theming.
+
+## CPU budget (Workers Free)
+
+Production runs on the Workers Free plan. Its limits shape the code:
+
+- **10 ms of CPU** per HTTP request (`waitUntil` work included), per cron run and per Workflow
+  step. Waiting on `fetch`, D1 or a Durable Object doesn't count; `crypto.subtle` does. Going over
+  is Error 1102 for a request, a failed attempt for a step. Wall time is generous, CPU isn't.
+- **Nearly every request is a cold isolate** on a site this quiet, so module-scope work is paid
+  on every route. Keep module scope to constants: no `Intl` objects, big regexes, parsing or
+  crypto at import time.
+- **Heavy work goes into Workflow steps**, each with its own 10 ms and retries: announcements
+  (`AnnounceWorkflow`), inbound email (`InboundWorkflow`), the daily job (`DailyWorkflow`). A
+  request or the cron only writes what it must and starts an instance. Batch sizes keep a step
+  inside its budget and under **50 external subrequests** (push and webhooks: 10 per step; email:
+  one Resend batch request of 20). An instance may take 1,024 steps, and the account 3,000 a day.
+- **No headless browser.** The social cards are pre-rendered PNGs (`scripts/og-render.ts`).
+- **Memoise `Intl`, or avoid it.** The first `Intl` call in an isolate (any `DateTimeFormat`,
+  `NumberFormat`, `toLocaleString`, `localeCompare`) costs 6 to 8 ms of CPU starting ICU. Use the
+  helpers in `lib/time.ts` (`formatLondon`, `formatNumber`, …), which avoid ICU for the formats in
+  use; `dateTimeFormat`/`numberFormat` build any other formatter once per isolate.
+- **Cache per isolate** what only changes with the status or the day (rendered fragments, ledger
+  verification, the `ip_salt`), keyed on exactly what it depends on, and bounded.
+- **One round trip where possible**: `D1.batch` for several statements, `liveSnapshot` for every
+  live number, the state read skipped on routes that don't need it.
+- **Durable Object** requests get their own budget, but every counted check is one, so the
+  WaitingRoom keeps per-check work to memory and flushes to D1 in batches from its alarm.
 
 ## Local development & verification
 

@@ -257,7 +257,7 @@ ${section(
 		{ method: 'GET', path: '/stats', what: 'Anxiety analytics: who checks, when, and from where (aggregated).' },
 		{ method: 'GET', path: '/api/ledger', what: 'The Dad Ledger: a hash-chained, Ed25519-signed log of status changes.' },
 		{ method: 'GET', path: '/.well-known/dad-ledger.json', what: 'The ledger and its public key, for independent verification.' },
-		{ method: 'GET', path: '/og.png', what: 'The live social preview image.' },
+		{ method: 'GET', path: '/og.png', what: 'The social preview image for the current status (pre-rendered).' },
 		{ method: 'GET', path: '/api/push/key', what: 'The VAPID public key for Web Push.' },
 		{ method: 'POST', path: '/api/push/subscribe', what: 'Subscribe a browser to push notifications.' },
 		{ method: 'POST', path: '/api/push/unsubscribe', what: 'Unsubscribe it again.' },

@@ -6,12 +6,12 @@ import { html } from 'hono/html';
 import type { WaitingRoomDetails } from '../do/waiting-room-protocol';
 import { type CheckStats, getCheckStats, getCheckTotal, type Tally } from '../lib/counters';
 import { coloInfo, countryName, flagEmoji } from '../lib/counters-geo';
-import { type Html, renderPage } from '../lib/layout';
-import { waitingRoom } from '../lib/live';
+import { type Html, buildId, renderPage } from '../lib/layout';
+import { liveSnapshot, waitingRoom } from '../lib/live';
 import { allow, clientKey } from '../lib/security';
 import { getStatusHistory } from '../lib/state';
-import { formatLondonDate, londonDate, londonHour, TZ } from '../lib/time';
-import type { AppEnv, Status } from '../types';
+import { formatDayMonth, formatLondon, formatLondonDate, formatNumber, formatWeekdayDayMonth, londonDate, londonHour } from '../lib/time';
+import type { AppEnv, SiteState, Status } from '../types';
 
 export const liveRoutes = new Hono<AppEnv>();
 
@@ -44,7 +44,9 @@ liveRoutes.get('/api/live', async (c) => {
 			'Retry-After': '60',
 		});
 	}
-	const [live, checks] = await Promise.all([liveSnapshot(c.env), getCheckTotal(c.env)]);
+	// One RPC: the snapshot carries the check total too (getCheckTotal only if it couldn't).
+	const live = await liveSnapshot(c.env);
+	const checks = live.checks ?? (await getCheckTotal(c.env));
 	// reloadNonce lets polling tabs (no WebSocket) obey "reload every browser"; it's left out,
 	// rather than sent empty, when the waiting room is unreachable, so nobody reloads by mistake.
 	// state saves pollers from guessing it from the X-Is-Zack-A-Dad header.
@@ -60,15 +62,6 @@ liveRoutes.get('/api/live', async (c) => {
 		headers,
 	);
 });
-
-async function liveSnapshot(env: Env): Promise<{ viewers: number; vibes: number; reloadNonce?: string }> {
-	try {
-		return await waitingRoom(env).liveSnapshot();
-	} catch (err) {
-		console.error('live snapshot failed:', err);
-		return { viewers: 0, vibes: 0 };
-	}
-}
 
 /**
  * Hand the request to the WaitingRoom. The reply is re-wrapped so its headers are
@@ -125,6 +118,36 @@ async function cachedStatusHistory(env: Env): Promise<Array<{ status: Status; at
 	}
 }
 
+/**
+ * The rendered /stats page is the same for everyone served by one datacentre for a while, so
+ * it's kept in the edge cache (caches.default, which is per datacentre) for this long. On a
+ * quiet site most requests land in a fresh isolate, where a per-isolate cache would never hit;
+ * a cache hit skips the D1 reads, the Durable Object call and the render.
+ */
+export const STATS_CACHE_SECONDS = 30;
+
+/** The edge cache, where there is one (not in unit tests; a no-op on workers.dev). */
+function edgeCache(): Cache | null {
+	try {
+		return typeof caches === 'undefined' ? null : caches.default;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Cache key for a rendered /stats page: everything the page shows that isn't a shared count.
+ * The state goes in whole (the page shell carries the change time and due date for app.js,
+ * and a versioned og:image), and so does the build, so a deploy never serves the old shell.
+ * Not a routable path, and nothing in it comes from the query string.
+ */
+export function statsCacheKey(origin: string, state: SiteState, colo: string | null, build: string): string {
+	const parts = [state.status, state.statusChangedAt, state.dueDate ?? '-', colo ?? '-', build].map(encodeURIComponent);
+	return `${origin}/__cache/stats/v1/${parts.join('/')}`;
+}
+
+const HTML_NO_STORE = { 'Content-Type': 'text/html; charset=UTF-8', ...NO_STORE } as const;
+
 liveRoutes.get('/stats', async (c) => {
 	if (!(await allow(c.env.RL_API, `stats:${clientKey(c)}`))) {
 		return c.text('Too many requests. The statistics are not that exciting; try again in a minute.\n', 429, {
@@ -132,6 +155,26 @@ liveRoutes.get('/stats', async (c) => {
 			'Retry-After': '60',
 		});
 	}
+	const state = c.get('state');
+	const status = state.status;
+	const cf = c.req.raw.cf as Record<string, unknown> | undefined;
+	const colo = typeof cf?.colo === 'string' ? cf.colo : null;
+	const url = new URL(c.req.url);
+	// Local dev and production alike: advertise https unless it's genuinely a local host.
+	const local = url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '[::1]';
+	const origin = `${local ? url.protocol : 'https:'}//${url.host}`;
+
+	const cache = edgeCache();
+	const build = buildId(c.env);
+	const cacheKey = statsCacheKey(origin, state, colo, build ? `${build.tag ?? build.id}@${build.timestamp ?? ''}` : 'local');
+	if (cache) {
+		const hit = await cache.match(cacheKey).catch((err: unknown) => {
+			console.error('stats cache read failed:', err);
+			return undefined;
+		});
+		if (hit) return new Response(hit.body, { status: 200, headers: HTML_NO_STORE });
+	}
+
 	const [stats, room, history] = await Promise.all([
 		getCheckStats(c.env).catch((err: unknown) => {
 			console.error('check stats failed:', err);
@@ -143,12 +186,6 @@ liveRoutes.get('/stats', async (c) => {
 			return [];
 		}),
 	]);
-	const cf = c.req.raw.cf as Record<string, unknown> | undefined;
-	const colo = typeof cf?.colo === 'string' ? cf.colo : null;
-	const url = new URL(c.req.url);
-	// Local dev and production alike: advertise https unless it's genuinely a local host.
-	const local = url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '[::1]';
-	const origin = `${local ? url.protocol : 'https:'}//${url.host}`;
 	// The first history row is the site's birth, not a change of answer.
 	const changeDays = new Set(
 		history
@@ -158,12 +195,12 @@ liveRoutes.get('/stats', async (c) => {
 	);
 
 	c.header('Cache-Control', 'no-store');
-	return renderPage(c, {
+	const res = await renderPage(c, {
 		title: 'Anxiety analytics',
 		description: 'How often people check whether Zack is a dad, when, and from where. Aggregated, anonymous and slightly concerning.',
 		status: stats ? 200 : 503,
 		body: statsPage({
-			status: c.get('state').status,
+			status,
 			stats,
 			room,
 			answerChanges: Math.max(0, history.length - 1),
@@ -172,6 +209,19 @@ liveRoutes.get('/stats', async (c) => {
 			origin,
 		}),
 	});
+	// Only a complete page is worth sharing: not the counters-down 503, nor a missing waiting room.
+	if (cache && res.status === 200 && room.available && res.body) {
+		const copy = new Response(res.clone().body, {
+			headers: { 'Content-Type': HTML_NO_STORE['Content-Type'], 'Cache-Control': `public, max-age=${STATS_CACHE_SECONDS}` },
+		});
+		const put = cache.put(cacheKey, copy).catch((err: unknown) => console.error('stats cache write failed:', err));
+		try {
+			c.executionCtx.waitUntil(put);
+		} catch {
+			// No execution context (tests): the put just runs unawaited.
+		}
+	}
+	return res;
 });
 
 interface StatsView {
@@ -184,16 +234,26 @@ interface StatsView {
 	origin: string;
 }
 
-const numberFormat = new Intl.NumberFormat('en-GB');
-const percentFormat = new Intl.NumberFormat('en-GB', { style: 'percent', maximumFractionDigits: 1 });
-const shortDay = new Intl.DateTimeFormat('en-GB', { timeZone: 'UTC', day: 'numeric', month: 'short' });
-const longDay = new Intl.DateTimeFormat('en-GB', { timeZone: 'UTC', weekday: 'short', day: 'numeric', month: 'short' });
-const londonClock = new Intl.DateTimeFormat('en-GB', { timeZone: TZ, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
-
-const fmt = (n: number): string => numberFormat.format(n);
+// No Intl here (see lib/time.ts): the first Intl call in a fresh isolate costs milliseconds.
+const fmt = (n: number): string => formatNumber(n);
 const plural = (n: number, one: string, many: string): string => `${fmt(n)} ${n === 1 ? one : many}`;
-const ymdDate = (ymd: string): Date => new Date(`${ymd}T12:00:00Z`);
 const hourLabel = (h: number): string => `${String(h).padStart(2, '0')}:00`;
+/** "12:34", London time. */
+const londonClock = (d: Date): string => formatLondon(d.toISOString(), { weekday: undefined, day: undefined, month: undefined, year: undefined });
+
+/**
+ * A share (0-1) as en-GB writes it with `{ style: 'percent', maximumFractionDigits: 1 }`:
+ * "12.3%", "12%", "0.1%", "100%". Like ICU, it rounds the shortest decimal that round-trips
+ * (what String() gives), half away from zero, so 0.0045 is "0.5%" (toFixed would say 0.4).
+ */
+export function formatShare(share: number): string {
+	if (!(share >= 0 && share <= 1)) return new Intl.NumberFormat('en-GB', { style: 'percent', maximumFractionDigits: 1 }).format(share);
+	if (share < 0.0005) return '0%'; // also keeps String() out of exponent notation
+	const [whole = '0', fraction = ''] = String(share).split('.');
+	const digits = `${fraction}0000`.slice(0, 4);
+	const tenths = Number(whole) * 1000 + Number(digits.slice(0, 3)) + (Number(digits[3]) >= 5 ? 1 : 0);
+	return `${Math.floor(tenths / 10)}${tenths % 10 ? `.${tenths % 10}` : ''}%`;
+}
 
 const LEDE: Record<Status, string> = {
 	no: 'Every time somebody asks whether Zack is a dad, a counter goes up. These are the counters. The answer, for the avoidance of doubt, is still no.',
@@ -290,13 +350,13 @@ function dailySection(stats: CheckStats, changeDays: ReadonlySet<string>): Html 
 	const peak = stats.daily.reduce((best, d) => (d.count > best.count ? d : best), stats.daily[0] ?? { day: today, count: 0 });
 	const bars: Bar[] = stats.daily.map((d) => ({
 		value: d.count,
-		label: `${longDay.format(ymdDate(d.day))}: ${plural(d.count, 'check', 'checks')}`,
+		label: `${formatWeekdayDayMonth(d.day)}: ${plural(d.count, 'check', 'checks')}`,
 		emphasis: peak.count > 0 && d.day === peak.day,
 		marker: d.day === today,
 	}));
 	const last = stats.daily.length - 1;
 	const axis = new Map<number, string>();
-	for (const i of [0, 7, 14, 21]) if (i < last) axis.set(i, shortDay.format(ymdDate(stats.daily[i]?.day ?? today)));
+	for (const i of [0, 7, 14, 21]) if (i < last) axis.set(i, formatDayMonth(stats.daily[i]?.day ?? today));
 	axis.set(last, 'Today');
 	const windowTotal = stats.daily.reduce((sum, d) => sum + d.count, 0);
 
@@ -310,12 +370,12 @@ function dailySection(stats: CheckStats, changeDays: ReadonlySet<string>): Html 
 	return html`<section class="section card stack" aria-labelledby="daily-heading">
 <h2 class="card-title" id="daily-heading">Checks per day</h2>
 <p class="muted">The last ${stats.daily.length} days in London: ${plural(windowTotal, 'check', 'checks')}.
-${peak.count > 0 ? html`Busiest was <strong>${longDay.format(ymdDate(peak.day))}</strong> with ${plural(peak.count, 'check', 'checks')}. ${peakNote}` : ''}</p>
+${peak.count > 0 ? html`Busiest was <strong>${formatWeekdayDayMonth(peak.day)}</strong> with ${plural(peak.count, 'check', 'checks')}. ${peakNote}` : ''}</p>
 ${barChart(
 	'daily-chart',
 	`Checks per day for the last ${stats.daily.length} days`,
 	windowTotal > 0
-		? `Bar chart. ${windowTotal} checks in total; the busiest day was ${longDay.format(ymdDate(peak.day))} with ${peak.count}. The marked bar is today.`
+		? `Bar chart. ${windowTotal} checks in total; the busiest day was ${formatWeekdayDayMonth(peak.day)} with ${peak.count}. The marked bar is today.`
 		: `Bar chart. No checks at all in the last ${stats.daily.length} days. The marked bar is today.`,
 	bars,
 	axis,
@@ -376,7 +436,7 @@ ${barChart('hourly-chart', 'Checks by hour of day (London time)', `Bar chart of 
 function shareCell(count: number, total: number): Html {
 	const share = total > 0 ? count / total : 0;
 	const width = Math.max(0, Math.min(100, Math.round(share * 1000) / 10));
-	return html`<td><div class="meter" aria-hidden="true"><span style="width:${width}%"></span></div><span class="tiny muted">${percentFormat.format(share)}</span></td>`;
+	return html`<td><div class="meter" aria-hidden="true"><span style="width:${width}%"></span></div><span class="tiny muted">${formatShare(share)}</span></td>`;
 }
 
 function countriesSection(stats: CheckStats, status: Status): Html {
@@ -436,7 +496,7 @@ function youSection(colo: string | null): Html {
 	return html`<section class="section card stack" aria-labelledby="you-heading">
 <h2 class="card-title" id="you-heading">Meanwhile, at your end</h2>
 <p>You were served by ${where}. Your request went there, asked a database whether Zack is a dad, and came back with the answer faster than you could have asked out loud.</p>
-<p>It is <time datetime="${now.toISOString()}"><strong>${londonClock.format(now)}</strong> on ${formatLondonDate(londonDate(now))}</time> in London, the only time zone this site recognises.</p>
+<p>It is <time datetime="${now.toISOString()}"><strong>${londonClock(now)}</strong> on ${formatLondonDate(londonDate(now))}</time> in London, the only time zone this site recognises.</p>
 </section>`;
 }
 

@@ -113,11 +113,34 @@ export async function getVapidPublicKey(env: Env): Promise<string> {
 	return (await loadVapid(env)).keys.publicKey;
 }
 
+/**
+ * A signed header is reused for every push to the same push service (the JWT's audience is the
+ * service's origin, not the subscription) until it has less than this long left to live.
+ */
+export const VAPID_REUSE_MARGIN_SECONDS = 60 * 60;
+
+// Signed headers per database binding, then per push-service origin. A fan-out step pushes to a
+// handful of origins (FCM, Mozilla, Apple, WNS), so it signs a handful of JWTs, not one per push.
+const signedHeaders = new WeakMap<object, Map<string, { exp: number; header: Promise<string> }>>();
+
 /** The `Authorization` header for a push to `endpoint`, signed with the site's keys. */
 export async function vapidHeaderForEndpoint(env: Env, endpoint: string, now: number = Date.now()): Promise<string> {
-	const { keys, signingKey } = await loadVapid(env);
-	const jwt = await signJwt(signingKey, vapidClaims(endpoint, now));
-	return formatVapidHeader(jwt, keys.publicKey);
+	const claims = vapidClaims(endpoint, now);
+	let byOrigin = signedHeaders.get(env.DB);
+	if (!byOrigin) signedHeaders.set(env.DB, (byOrigin = new Map()));
+	const cached = byOrigin.get(claims.aud);
+	// Also re-sign if the cached token expires further out than a fresh one would (a clock jump).
+	if (cached && cached.exp - now / 1000 > VAPID_REUSE_MARGIN_SECONDS && cached.exp <= claims.exp) return cached.header;
+	const header = (async () => {
+		const { keys, signingKey } = await loadVapid(env);
+		return formatVapidHeader(await signJwt(signingKey, claims), keys.publicKey);
+	})();
+	const entry = { exp: claims.exp, header };
+	byOrigin.set(claims.aud, entry);
+	header.catch(() => {
+		if (byOrigin.get(claims.aud) === entry) byOrigin.delete(claims.aud);
+	});
+	return header;
 }
 
 /** Import a private JWK for signing. */

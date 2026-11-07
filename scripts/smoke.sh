@@ -895,6 +895,12 @@ if [[ $MUTATE == 1 ]]; then
 		expect_no_body_i 'type="password"'
 		finish
 
+		begin "The retired live OG render says so (410 for JSON)"
+		request POST /admin/og/render --cookie "$JAR" --header "Origin: $ORIGIN" --header 'Accept: application/json'
+		expect_status 410
+		expect_json '.ok == false'
+		finish
+
 		begin "A cross-site button press is refused"
 		request POST /admin/status --cookie "$JAR" --header "Origin: $EVIL_ORIGIN" --header 'Accept: application/json' \
 			--data 'status=soon&confirm=SOON'

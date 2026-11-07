@@ -7,7 +7,7 @@
 // Pure helpers are unit-tested in test/community-*.test.ts.
 
 import type { Status } from '../types';
-import { nowIso } from './time';
+import { formatNumber, nowIso } from './time';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared text helpers
@@ -61,11 +61,9 @@ export function parseId(raw: unknown): number | null {
 	return Number.isSafeInteger(id) ? id : null;
 }
 
-const numberFormat = new Intl.NumberFormat('en-GB');
-
 /** "1 message", "2 messages", "1,204 messages". */
 export function plural(count: number, singular: string, pluralForm = `${singular}s`): string {
-	return `${numberFormat.format(count)} ${count === 1 ? singular : pluralForm}`;
+	return `${formatNumber(count)} ${count === 1 ? singular : pluralForm}`;
 }
 
 export type FieldErrors<F extends string> = Partial<Record<F, string>>;
@@ -197,7 +195,8 @@ export function reorderIds(ids: readonly number[], id: number, direction: 'up' |
 
 /** Suggested items not already on the list (case- and whitespace-insensitive). */
 export function missingSuggestions(existingLabels: readonly string[], suggestions: readonly string[] = SUGGESTED_CHECKLIST): string[] {
-	const key = (s: string) => cleanLine(s).toLocaleLowerCase('en-GB');
+	// toLowerCase, not toLocaleLowerCase('en-GB'): the same for English, and no ICU start-up cost.
+	const key = (s: string) => cleanLine(s).toLowerCase();
 	const have = new Set(existingLabels.map(key));
 	const out: string[] = [];
 	for (const label of suggestions) {
@@ -239,6 +238,26 @@ export async function getReadiness(env: Env): Promise<Readiness> {
 	} catch (err) {
 		console.error('getReadiness failed:', err);
 		return { done: 0, total: 0, percent: 0, items: [] };
+	}
+}
+
+export type ReadinessSummary = Pick<Readiness, 'done' | 'total' | 'percent'>;
+
+/**
+ * Just the numbers, for the home page's readiness panel: one aggregate row instead of every
+ * checklist item. Never throws: an unreadable checklist is an empty one.
+ */
+export async function getReadinessSummary(env: Env): Promise<ReadinessSummary> {
+	try {
+		const row = await env.DB.prepare(
+			'SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN done = 1 THEN 1 ELSE 0 END), 0) AS done FROM checklist',
+		).first<{ total: number; done: number }>();
+		const total = Number(row?.total ?? 0);
+		const done = Number(row?.done ?? 0);
+		return { done, total, percent: readinessPercent(done, total) };
+	} catch (err) {
+		console.error('getReadinessSummary failed:', err);
+		return { done: 0, total: 0, percent: 0 };
 	}
 }
 

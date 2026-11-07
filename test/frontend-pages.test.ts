@@ -1,14 +1,23 @@
-import { describe, expect, it, vi } from 'vitest';
+import { Hono } from 'hono';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { AppEnv, SiteState, Status } from '../src/types';
 
 // pages.ts mounts fragments from other modules; stub them so these unit tests only
 // exercise the frontend's own pure helpers.
 vi.mock('../src/routes/subscribe', () => ({ emailSignupForm: () => '' }));
 vi.mock('../src/routes/push', () => ({ pushWidget: () => '' }));
 vi.mock('../src/routes/webhooks', () => ({ webhookForm: () => '' }));
-vi.mock('../src/lib/counters', () => ({ getCheckTotal: async () => 0 }));
-vi.mock('../src/lib/community', () => ({ getReadiness: async () => ({ done: 0, total: 0, percent: 0, items: [] }) }));
-vi.mock('../src/lib/forecast', () => ({ dadForecast: () => [] }));
-vi.mock('../src/lib/fruit', () => ({ babySize: () => null }));
+const counters = vi.hoisted(() => ({ getCheckTotal: vi.fn(async () => 0) }));
+vi.mock('../src/lib/counters', () => ({ getCheckTotal: counters.getCheckTotal }));
+vi.mock('../src/lib/community', () => ({ getReadinessSummary: async () => ({ done: 0, total: 0, percent: 0 }) }));
+const pure = vi.hoisted(() => ({
+	dadForecast: vi.fn((_due: string | null, today: string, status: string) => [
+		{ date: today, probability: status === 'soon' ? 0.95 : 0, label: `Forecast for ${status}`, emoji: '☀️' },
+	]),
+	babySize: vi.fn(() => ({ week: 39, day: 2, fruit: 'a mini watermelon', emoji: '🍉' })),
+}));
+vi.mock('../src/lib/forecast', () => ({ dadForecast: pure.dadForecast }));
+vi.mock('../src/lib/fruit', () => ({ babySize: pure.babySize }));
 
 const {
 	countdownCopy,
@@ -17,6 +26,7 @@ const {
 	geoFromRequest,
 	greeting,
 	londonMidnightMs,
+	pageRoutes,
 	withArticle,
 } = await import('../src/routes/pages');
 
@@ -123,5 +133,108 @@ describe('withArticle', () => {
 		expect(withArticle('avocado')).toBe('an avocado');
 		expect(withArticle('a large lime')).toBe('a large lime');
 		expect(withArticle('  the moon ')).toBe('the moon');
+	});
+});
+
+describe('GET / live numbers', () => {
+	async function homeWith(env: Partial<Env>): Promise<string> {
+		const app = new Hono<AppEnv>();
+		app.use('*', async (c, next) => {
+			c.set('state', { status: 'no', statusChangedAt: '2026-11-01T00:00:00.000Z', dueDate: null });
+			await next();
+		});
+		app.route('/', pageRoutes);
+		const res = await app.request('https://iszacka.dad/', {}, env as Env);
+		expect(res.status).toBe(200);
+		return res.text();
+	}
+
+	it('asks the waiting room once, for viewers, vibes and checks together', async () => {
+		const room = { liveSnapshot: vi.fn(async () => ({ viewers: 3, vibes: 7, checks: 48213, reloadNonce: 'n' })), stats: vi.fn() };
+		counters.getCheckTotal.mockClear();
+		const page = await homeWith({ WAITING_ROOM: { idFromName: () => 'global', get: () => room } as unknown as Env['WAITING_ROOM'] });
+		expect(room.liveSnapshot).toHaveBeenCalledTimes(1);
+		expect(room.stats).not.toHaveBeenCalled();
+		expect(counters.getCheckTotal).not.toHaveBeenCalled();
+		expect(page).toContain('<p class="big-number" data-live="checks">48,213</p>');
+		expect(page).toContain('<p class="big-number" data-live="viewers">3</p>');
+	});
+
+	it('falls back to getCheckTotal when the waiting room is down', async () => {
+		vi.spyOn(console, 'error').mockImplementation(() => {});
+		counters.getCheckTotal.mockClear();
+		counters.getCheckTotal.mockResolvedValueOnce(12);
+		const page = await homeWith({});
+		expect(counters.getCheckTotal).toHaveBeenCalledTimes(1);
+		expect(page).toContain('<p class="big-number" data-live="checks">12</p>');
+		vi.restoreAllMocks();
+	});
+});
+
+describe('GET / fragment caching', () => {
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+	});
+
+	async function home(state: SiteState): Promise<string> {
+		const app = new Hono<AppEnv>();
+		app.use('*', async (c, next) => {
+			c.set('state', state);
+			await next();
+		});
+		app.route('/', pageRoutes);
+		const res = await app.request('https://iszacka.dad/', { headers: { 'accept-language': 'en-GB' } }, {} as Env);
+		expect(res.status).toBe(200);
+		return res.text();
+	}
+
+	const variant = (page: string, s: Status) => page.match(new RegExp(`<div class="stack" data-status-variant="${s}"( hidden)?>[^]*?</div>`))?.[0] ?? '';
+
+	it('renders the forecast and fruit once per status, due date and London day', async () => {
+		vi.spyOn(console, 'error').mockImplementation(() => {});
+		vi.useFakeTimers({ now: new Date('2026-11-07T10:00:00Z'), toFake: ['Date'] });
+		const state: SiteState = { status: 'no', statusChangedAt: '2026-11-01T00:00:00.000Z', dueDate: '2026-11-09' };
+		pure.dadForecast.mockClear();
+		pure.babySize.mockClear();
+
+		const first = await home(state);
+		expect(pure.dadForecast).toHaveBeenCalledTimes(3); // one strip per status
+		expect(pure.babySize).toHaveBeenCalledTimes(1);
+		expect(first).toContain('Forecast for no');
+		expect(first).toContain('a mini watermelon');
+		expect(first).toContain('The answer in');
+
+		// Same inputs: served from the per-isolate cache, byte for byte.
+		const second = await home(state);
+		expect(pure.dadForecast).toHaveBeenCalledTimes(3);
+		expect(pure.babySize).toHaveBeenCalledTimes(1);
+		expect(second).toBe(first);
+
+		// A new London day re-renders.
+		vi.setSystemTime(new Date('2026-11-08T10:00:00Z'));
+		await home(state);
+		expect(pure.dadForecast).toHaveBeenCalledTimes(6);
+		expect(pure.dadForecast).toHaveBeenLastCalledWith('2026-11-09', '2026-11-08', 'yes');
+
+		// So does a new due date.
+		await home({ ...state, dueDate: '2026-11-10' });
+		expect(pure.dadForecast).toHaveBeenCalledTimes(9);
+	});
+
+	it('shows the variant for the current status when the status changes', async () => {
+		vi.spyOn(console, 'error').mockImplementation(() => {});
+		vi.useFakeTimers({ now: new Date('2026-11-07T10:00:00Z'), toFake: ['Date'] });
+		const no = await home({ status: 'no', statusChangedAt: '2026-11-01T00:00:00.000Z', dueDate: '2026-11-09' });
+		const yes = await home({ status: 'yes', statusChangedAt: '2026-11-07T09:00:00.000Z', dueDate: '2026-11-09' });
+		expect(variant(no, 'no')).not.toContain(' hidden>');
+		expect(variant(no, 'yes')).toContain(' hidden>');
+		expect(variant(yes, 'yes')).not.toContain(' hidden>');
+		expect(variant(yes, 'no')).toContain(' hidden>');
+		// The ticker, header and footer follow the status too.
+		expect(no).toMatch(/<span class="t-word" lang="fr" data-by-status data-no="Non" data-soon="Pas encore" data-yes="Oui">Non<\/span>/);
+		expect(yes).toMatch(/<span class="t-word" lang="fr" data-by-status data-no="Non" data-soon="Pas encore" data-yes="Oui">Oui<\/span>/);
+		expect(no).toMatch(/<span class="brand-answer" data-live="word">NO<\/span>/);
+		expect(yes).toMatch(/<span class="brand-answer" data-live="word">YES<\/span>/);
 	});
 });

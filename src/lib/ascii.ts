@@ -4,7 +4,7 @@
 
 import type { SiteState, Status } from '../types';
 import { DOMAIN, STATUS_COPY } from './site';
-import { daysBetween, formatLondon, formatLondonDate, londonDate } from './time';
+import { daysBetween, formatLondon, formatLondonDate, formatNumber, londonDate } from './time';
 
 /**
  * True for command-line HTTP clients that want text, not HTML: curl, Wget (1 and 2),
@@ -130,7 +130,7 @@ function box(lines: string[], colour: (s: string) => string): string[] {
 }
 
 function plural(n: number, word: string): string {
-	return `${n.toLocaleString('en-GB')} ${word}${n === 1 ? '' : 's'}`;
+	return `${formatNumber(n)} ${word}${n === 1 ? '' : 's'}`;
 }
 
 /** The due / overdue / arrival line. */

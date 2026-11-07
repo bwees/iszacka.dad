@@ -47,7 +47,7 @@ import {
 import { allow, clientIp, clientKey, hashIdentifier, sha256Hex, turnstileWidget, verifyTurnstile, wantsJson } from '../lib/security';
 import { DAD, DOMAIN } from '../lib/site';
 import { getStatusHistory } from '../lib/state';
-import { formatLondon, formatLondonDate, londonDate, nowIso } from '../lib/time';
+import { formatLondon, formatLondonDate, formatNumber, formatWeekdayDayMonth, londonDate, nowIso } from '../lib/time';
 import type { AppEnv, SiteState, Status } from '../types';
 
 export const funRoutes = new Hono<AppEnv>();
@@ -91,15 +91,22 @@ const FUN_CSS = `
 
 const funHead = () => html`<style>${raw(FUN_CSS)}</style>`;
 
-const dayLabelFormatter = new Intl.DateTimeFormat('en-GB', { timeZone: 'UTC', weekday: 'short', day: 'numeric', month: 'short' });
+/** /status labels the same 90 days four times over, so labels are kept (bounded). */
+const shortDates = new Map<string, string>();
 
 /** "Sat 14 Nov" for a 'YYYY-MM-DD'. */
 function shortDate(ymd: string): string {
-	return dayLabelFormatter.format(new Date(`${ymd}T12:00:00Z`));
+	let label = shortDates.get(ymd);
+	if (label === undefined) {
+		label = formatWeekdayDayMonth(ymd);
+		if (shortDates.size >= 400) shortDates.clear();
+		shortDates.set(ymd, label);
+	}
+	return label;
 }
 
 function plural(n: number, one: string, many = `${one}s`): string {
-	return `${n.toLocaleString('en-GB')} ${n === 1 ? one : many}`;
+	return `${formatNumber(n)} ${n === 1 ? one : many}`;
 }
 
 function percent(p: number): string {
@@ -298,10 +305,10 @@ Name: Alex</pre>
 	<section class="section stack" aria-labelledby="pool-crowd">
 		<h2 id="pool-crowd">The wisdom of the crowd</h2>
 		<div class="stats">
-			<div class="stat"><span class="stat-value">${guesses.length.toLocaleString('en-GB')}</span><span class="stat-label">${guesses.length === 1 ? 'guess' : 'guesses'}</span></div>
+			<div class="stat"><span class="stat-value">${formatNumber(guesses.length)}</span><span class="stat-label">${guesses.length === 1 ? 'guess' : 'guesses'}</span></div>
 			${board.mode === 'open'
-				? html`<div class="stat"><span class="stat-value">${board.inTheRunning.toLocaleString('en-GB')}</span><span class="stat-label">still in the running</span></div>
-				<div class="stat"><span class="stat-value">${board.eliminated.toLocaleString('en-GB')}</span><span class="stat-label">eliminated by the passage of time</span></div>`
+				? html`<div class="stat"><span class="stat-value">${formatNumber(board.inTheRunning)}</span><span class="stat-label">still in the running</span></div>
+				<div class="stat"><span class="stat-value">${formatNumber(board.eliminated)}</span><span class="stat-label">eliminated by the passage of time</span></div>`
 				: ''}
 			${median
 				? html`<div class="stat"><span class="stat-value"><time datetime="${median}">${formatLondon(median, { weekday: undefined, year: undefined })}</time></span><span class="stat-label">median guess</span></div>`
@@ -785,7 +792,7 @@ const POSTER_CSS = `
 `;
 
 /** The QR code for `text` as an inline SVG: one path, horizontal runs merged, 4-module quiet zone. */
-function qrSvg(text: string, label: string) {
+function qrSvg(text: string, label: string): string {
 	const qr = qrcode(0, 'M');
 	qr.addData(text);
 	qr.make();
@@ -805,8 +812,13 @@ function qrSvg(text: string, label: string) {
 		}
 	}
 	const size = n + quiet * 2;
-	return html`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size} ${size}" shape-rendering="crispEdges" role="img" aria-label="${label}"><title>${label}</title><rect width="${size}" height="${size}" fill="#fff"/><path fill="#111" d="${d}"/></svg>`;
+	return String(
+		html`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size} ${size}" shape-rendering="crispEdges" role="img" aria-label="${label}"><title>${label}</title><rect width="${size}" height="${size}" fill="#fff"/><path fill="#111" d="${d}"/></svg>`,
+	);
 }
+
+/** The poster's QR code never changes, and making one tries eight masks, so it's made once per isolate. */
+let posterQr: string | undefined;
 
 funRoutes.get('/poster', (c) => {
 	const strips = Array.from(
@@ -818,7 +830,7 @@ funRoutes.get('/poster', (c) => {
 	<article class="fun-poster" aria-label="Fridge poster">
 		<p class="fun-poster-flag">Public information notice</p>
 		<h1 class="fun-poster-title">Is Zack a dad?</h1>
-		<div class="fun-poster-qr">${qrSvg(POSTER_URL, `QR code linking to ${POSTER_URL}`)}</div>
+		<div class="fun-poster-qr">${raw((posterQr ??= qrSvg(POSTER_URL, `QR code linking to ${POSTER_URL}`)))}</div>
 		<p class="fun-poster-cta">Scan to find out</p>
 		<p class="fun-poster-sub">Or visit ${DOMAIN}. Answers 24 hours a day. Updated the moment it happens. No app required. Fridge-safe.</p>
 		<p class="fun-poster-reward">Reward: the smug feeling of knowing first</p>

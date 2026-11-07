@@ -2,41 +2,37 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 
-const h = vi.hoisted(() => ({
-	updateAnswerRecord: vi.fn(async () => ({ ok: true, detail: 'answer.iszacka.dad already says "is-zack-a-dad=no"' })),
-	getState: vi.fn(async () => ({ status: 'no', statusChangedAt: '2026-11-01T00:00:00.000Z', dueDate: '2026-11-20' })),
-}));
-vi.mock('../src/notify/dns', () => ({ updateAnswerRecord: h.updateAnswerRecord }));
-vi.mock('../src/lib/state', () => ({ getState: h.getState, getSetting: vi.fn(async () => null) }));
-vi.mock('../src/lib/og', () => ({ renderOgImage: vi.fn(async () => ({ ok: true })) }));
-vi.mock('../src/lib/updates', () => ({ createUpdate: vi.fn() }));
-vi.mock('../src/routes/resend-webhook', () => ({ purgeResendEvents: vi.fn(async () => 0) }));
+const { dailyInstanceId, handleScheduled, startDaily } = await import('../src/cron');
 
-const { handleScheduled } = await import('../src/cron');
-
-function env(): Env {
-	const now = new Date().toISOString();
-	return {
-		DB: {
-			// lastDailyDate: today's post already exists, so the daily post is skipped.
-			prepare: () => ({ first: async () => ({ created_at: now }), bind: () => ({ first: async () => null }) }),
-			batch: async () => [{ meta: { changes: 0 } }, { meta: { changes: 0 } }],
-		},
-	} as unknown as Env;
+function env(create: (opts: { id: string; params: unknown }) => Promise<unknown>) {
+	const DAILY = { create: vi.fn(create) };
+	return { env: { DAILY } as unknown as Env, create: DAILY.create };
 }
 
 describe('daily cron', () => {
-	it('re-syncs the DNS answer record every day, even when the daily post is skipped', async () => {
-		await handleScheduled({ scheduledTime: Date.now() } as ScheduledController, env(), {} as ExecutionContext);
-		expect(h.updateAnswerRecord).toHaveBeenCalledTimes(1);
-		expect(h.getState).toHaveBeenCalledWith(expect.anything(), { fresh: true });
+	it("does nothing but start the day's DailyWorkflow, named after the London date", async () => {
+		const { env: e, create } = env(async () => ({ id: 'x' }));
+		// 23:30 UTC in summer is already the next day in London.
+		const scheduledTime = Date.parse('2026-06-01T23:30:00Z');
+		await handleScheduled({ scheduledTime } as ScheduledController, e, {} as ExecutionContext);
+		expect(create).toHaveBeenCalledTimes(1);
+		expect(create).toHaveBeenCalledWith({ id: 'daily-2026-06-02', params: { day: '2026-06-02', at: '2026-06-01T23:30:00.000Z' } });
+		expect(dailyInstanceId('2026-11-07')).toBe('daily-2026-11-07');
 	});
 
-	it('reports a failed DNS sync as a failed run', async () => {
-		h.updateAnswerRecord.mockResolvedValueOnce({ ok: false, detail: 'Cloudflare API timed out' });
-		await expect(handleScheduled({ scheduledTime: Date.now() } as ScheduledController, env(), {} as ExecutionContext)).rejects.toThrow(
-			/1 task/,
-		);
+	it('treats an existing instance as "already ran today", not a failure', async () => {
+		const { env: e } = env(async () => {
+			throw new Error('instance.already_exists: Workflow instance already exists');
+		});
+		expect(await startDaily(e, new Date('2026-11-07T09:00:00Z'))).toEqual({ alreadyRan: 'daily-2026-11-07' });
+		await expect(handleScheduled({ scheduledTime: Date.parse('2026-11-07T09:00:00Z') } as ScheduledController, e, {} as ExecutionContext)).resolves.toBeUndefined();
+	});
+
+	it('fails the invocation when the workflow cannot be started', async () => {
+		const { env: e } = env(async () => {
+			throw new Error('Workflows is having a moment');
+		});
+		await expect(handleScheduled({ scheduledTime: Date.now() } as ScheduledController, e, {} as ExecutionContext)).rejects.toThrow(/having a moment/);
 	});
 });
 

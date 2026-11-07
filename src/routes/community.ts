@@ -73,7 +73,7 @@ import {
 	wantsJson,
 } from '../lib/security';
 import { DAD, PARENTS, STATUS_COPY } from '../lib/site';
-import { daysBetween, formatLondon, formatLondonDate, londonDate } from '../lib/time';
+import { daysBetween, formatLondon, formatLondonDate, formatNumber, londonDate } from '../lib/time';
 import type { AppEnv, SiteState, Status } from '../types';
 
 type Ctx = Context<AppEnv>;
@@ -806,7 +806,7 @@ function stats(entries: Array<[string, number]>): Html {
 	return html`<div class="stats">
 		${entries.map(
 			([label, value]) =>
-				html`<div class="stat"><span class="stat-value">${value.toLocaleString('en-GB')}</span><span class="stat-label">${label}</span></div>`,
+				html`<div class="stat"><span class="stat-value">${formatNumber(value)}</span><span class="stat-label">${label}</span></div>`,
 		)}
 	</div>`;
 }

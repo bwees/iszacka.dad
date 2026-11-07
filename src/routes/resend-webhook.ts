@@ -2,32 +2,29 @@
 // Resend webhook endpoint (POST /api/resend/webhook). Resend signs every delivery with svix:
 // the signature is verified before anything is parsed, then the svix-id is recorded in
 // `resend_events` so a retried or duplicated delivery is acknowledged but never processed
-// twice. For email.received the full email is fetched from Resend before answering (bounded by
-// RECEIVE_FETCH_TIMEOUT_MS, well inside Svix's 15s), so a transient failure can hand the retry
-// back to Resend; the rest of the work (auto-replying, disabling bounced subscribers) happens in
-// waitUntil so the response stays quick.
+// twice. On Workers Free the whole invocation gets 10 ms of CPU (waitUntil included), so the
+// route does no email work itself: an email.received event starts an InboundWorkflow instance
+// (src/workflows/inbound.ts), whose steps each get their own budget and retries.
 //
 // Responses: 503 if RESEND_WEBHOOK_SECRET isn't set, 401 for a bad signature, 400 for a body
 // that isn't JSON, 500 if the dedupe table can't be written (Resend retries later), 503 if the
-// received email couldn't be fetched for a transient reason (429, 5xx, network error, timeout:
-// the svix-id claim is released so Resend's redelivery is handled, not taken for a duplicate),
-// else 200.
+// workflow instance couldn't be started (the svix-id claim is released, so Resend's redelivery
+// is handled, not taken for a duplicate), else 200.
 //
 // Events:
-//   email.received    fetch the full email (transient failure: release the claim, 503); once
-//                     the claim is kept, count it against the quota and run the inbound handler
-//                     in waitUntil. A permanent failure (404 or other 4xx, no email_id, no
-//                     RESEND_API_KEY) still counts against the quota and answers 200.
-//   email.bounced     disable every recipient subscriber (permanent rejection)
-//   email.complained  disable every recipient subscriber (marked as spam)
+//   email.received    start INBOUND with id `inbound-<svix-id>` and {emailId, from, svixId};
+//                     an instance that already exists counts as started
+//   email.bounced     disable every recipient subscriber (permanent rejection), inline
+//   email.complained  disable every recipient subscriber (marked as spam), inline
 //   anything else     200, ignored
 
 import { Hono } from 'hono';
-import { bareAddress, handleInboundEmail, type InboundEmail } from '../email-handler';
-import { timingSafeEqual } from '../lib/security';
+import { bareAddress } from '../email-handler';
+import { sha256Hex, timingSafeEqual } from '../lib/security';
 import { nowIso } from '../lib/time';
-import { RESEND_API_BASE, RESEND_USER_AGENT, disableSubscriberByEmail, recordEmailSend } from '../notify/email';
+import { disableSubscriberByEmail } from '../notify/email';
 import type { AppEnv } from '../types';
+import type { InboundParams } from '../workflows/inbound';
 
 export const resendWebhookRoutes = new Hono<AppEnv>();
 
@@ -99,21 +96,6 @@ export interface ResendEvent {
 	};
 }
 
-/** The parsed body of GET /emails/receiving/{id} (fields we care about). */
-export interface ReceivedEmail {
-	id: string;
-	/** May be "Name <addr>"; only the address is ever used. */
-	from?: string;
-	to?: string[];
-	subject?: string;
-	text?: string | null;
-	html?: string | null;
-	headers?: Record<string, string | string[]>;
-	message_id?: string;
-	/** Resend's own SPF/DKIM/DMARC verdicts (null for emails received before it existed). */
-	authentication?: { spf?: string | null; dkim?: string | null; dmarc?: string | null } | null;
-}
-
 /** Longest svix-id we'll store (real ones are ~30 characters). */
 const MAX_SVIX_ID = 200;
 /** resend_events rows older than this are purged by the daily cron. */
@@ -147,73 +129,50 @@ export async function purgeResendEvents(env: Pick<Env, 'DB'>, now: Date = new Da
 	return res.meta.changes ?? 0;
 }
 
-/**
- * How long the route waits for GET /emails/receiving/{id}. Svix gives up on a delivery after
- * 15 seconds, so this leaves room for the D1 writes either side and still answers in time.
- */
-export const RECEIVE_FETCH_TIMEOUT_MS = 8_000;
-
-/** The outcome of fetching a received email. `transient` failures are worth Resend redelivering. */
-export type FetchReceivedResult = { ok: true; email: ReceivedEmail } | { ok: false; transient: boolean };
+/** Longest Workflow instance id (Workflows allows 100). */
+const MAX_INSTANCE_ID = 100;
+/** Finished inbound instances (and the sender address in their params) are kept this long. */
+export const INBOUND_SUCCESS_RETENTION = '1 day';
+/** Recipients a bounce or complaint may unsubscribe (ours go to one address at a time). */
+const MAX_BOUNCE_RECIPIENTS = 10;
 
 /**
- * Fetch the full received email (the webhook only carries metadata). Never throws. 429, 5xx,
- * network errors and timeouts are transient; 404, other 4xx and a missing API key are not.
+ * The InboundWorkflow instance id for a delivery: `inbound-<svix-id>`, so a redelivery maps to
+ * the same instance. A svix-id that isn't a valid instance id (Workflows allows letters,
+ * digits, `-` and `_`, up to 100) is hashed instead.
  */
-async function fetchReceivedEmail(env: Env, emailId: string): Promise<FetchReceivedResult> {
-	if (!env.RESEND_API_KEY) {
-		console.error('inbound: RESEND_API_KEY is not set; cannot fetch the received email');
-		return { ok: false, transient: false };
-	}
-	const base = (env.RESEND_API_BASE || RESEND_API_BASE).replace(/\/+$/, '');
+export async function inboundInstanceId(svixId: string): Promise<string> {
+	const id = `inbound-${svixId}`;
+	if (id.length <= MAX_INSTANCE_ID && /^[A-Za-z0-9_-]+$/.test(svixId)) return id;
+	return `inbound-h${(await sha256Hex(svixId)).slice(0, 40)}`;
+}
+
+/**
+ * Start the InboundWorkflow instance for an email.received delivery. True if it is running
+ * (just created, or created by an earlier delivery of the same event); false if it couldn't be
+ * started, and Resend should redeliver. Never throws.
+ */
+export async function startInbound(env: Pick<Env, 'INBOUND'>, id: string, params: InboundParams): Promise<boolean> {
 	try {
-		const res = await fetch(`${base}/emails/receiving/${encodeURIComponent(emailId)}`, {
-			headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'User-Agent': RESEND_USER_AGENT },
-			signal: AbortSignal.timeout(RECEIVE_FETCH_TIMEOUT_MS),
-		});
-		if (!res.ok) {
-			const transient = res.status === 429 || res.status >= 500;
-			console.error(`inbound: fetching the received email failed: HTTP ${res.status}${transient ? ' (asking Resend to redeliver)' : ''}`);
-			return { ok: false, transient };
+		await env.INBOUND.create({ id, params, retention: { successRetention: INBOUND_SUCCESS_RETENTION } });
+		return true;
+	} catch (createError) {
+		// create() throws for an id that already exists: that delivery was already handed off.
+		try {
+			await env.INBOUND.get(id);
+			return true;
+		} catch {
+			console.error('resend webhook: could not start the inbound workflow:', createError instanceof Error ? createError.message : String(createError));
+			return false;
 		}
-		return { ok: true, email: (await res.json()) as ReceivedEmail };
-	} catch (err) {
-		console.error('inbound: fetching the received email failed (asking Resend to redeliver):', err instanceof Error ? err.message : String(err));
-		return { ok: false, transient: true };
 	}
 }
 
-/**
- * The InboundEmail for the handler. The sender is the webhook's `data.from` (Resend sends the
- * bare address there for received mail) in preference to the retrieved email's `from`, which
- * can carry a display name; either way it's reduced to the bare, lower-cased address.
- */
-export function toInboundEmail(data: ResendEvent['data'], received: ReceivedEmail): InboundEmail {
-	const headers = received.headers ?? {};
-	const references = headers.references;
-	return {
-		from: bareAddress(data?.from) || bareAddress(received.from),
-		subject: received.subject ?? data?.subject ?? '',
-		text: received.text,
-		html: received.html,
-		headers,
-		messageId: received.message_id ?? data?.message_id ?? null,
-		references: Array.isArray(references) ? references.join(' ') : (references ?? null),
-		id: received.id ?? data?.email_id ?? null,
-		// The structured verdicts only; never the Authentication-Results headers the sender wrote.
-		authentication: received.authentication ?? null,
-	};
-}
-
-/**
- * Runs once the claim on an email.received delivery is kept (so a released, redelivered event
- * is counted once). `received` is null after a permanent fetch failure: nothing to reply to.
- */
-async function handleReceived(env: Env, data: ResendEvent['data'], received: ReceivedEmail | null): Promise<void> {
-	// Resend counts received emails against the same daily quota as sends.
-	await recordEmailSend(env);
-	if (!received) return;
-	await handleInboundEmail(toInboundEmail(data, received), env);
+/** The InboundWorkflow params for an email.received event. */
+export function inboundParams(data: ResendEvent['data'], svixId: string): InboundParams {
+	const emailId = typeof data?.email_id === 'string' ? data.email_id.slice(0, 200) : '';
+	// Resend sends the bare address here for received mail; reduce it anyway.
+	return { emailId, from: bareAddress(typeof data?.from === 'string' ? data.from : ''), svixId: svixId.slice(0, MAX_SVIX_ID) };
 }
 
 async function handleBounceOrComplaint(env: Env, type: string, data: ResendEvent['data']): Promise<void> {
@@ -223,8 +182,9 @@ async function handleBounceOrComplaint(env: Env, type: string, data: ResendEvent
 		console.log(`inbound: ${type}: ${bounceType} bounce; leaving the subscriber alone`);
 		return;
 	}
-	for (const to of data?.to ?? []) {
-		const address = bareAddress(to);
+	const recipients = Array.isArray(data?.to) ? data.to.slice(0, MAX_BOUNCE_RECIPIENTS) : [];
+	for (const to of recipients) {
+		const address = bareAddress(typeof to === 'string' ? to : '');
 		if (!address) continue;
 		const disabled = await disableSubscriberByEmail(env, address);
 		console.log(`inbound: ${type}: ${disabled ? 'unsubscribed a subscriber' : 'no matching subscriber'}`);
@@ -261,32 +221,24 @@ resendWebhookRoutes.post('/api/resend/webhook', async (c) => {
 
 	switch (type) {
 		case 'email.received': {
-			const emailId = event.data?.email_id;
-			let fetched: FetchReceivedResult;
-			if (emailId) {
-				fetched = await fetchReceivedEmail(c.env, emailId);
-			} else {
-				console.error('inbound: email.received without an email_id');
-				fetched = { ok: false, transient: false };
+			const params = inboundParams(event.data, svixId);
+			if (!params.emailId) console.error('inbound: email.received without an email_id');
+			if (await startInbound(c.env, await inboundInstanceId(svixId), params)) return c.json({ ok: true });
+			// Give the svix-id back so Resend's redelivery is processed, not taken for a duplicate.
+			try {
+				await releaseResendEvent(c.env, svixId);
+			} catch (err) {
+				console.error(
+					'resend webhook: could not release the event, so its redelivery will be ignored:',
+					err instanceof Error ? err.message : String(err),
+				);
 			}
-			if (!fetched.ok && fetched.transient) {
-				// Give the svix-id back so Resend's redelivery is processed, not taken for a duplicate.
-				try {
-					await releaseResendEvent(c.env, svixId);
-				} catch (err) {
-					console.error(
-						'resend webhook: could not release the event, so its redelivery will be ignored:',
-						err instanceof Error ? err.message : String(err),
-					);
-				}
-				return c.json({ ok: false, error: 'try again later' }, 503);
-			}
-			c.executionCtx.waitUntil(handleReceived(c.env, event.data, fetched.ok ? fetched.email : null));
-			return c.json({ ok: true });
+			return c.json({ ok: false, error: 'try again later' }, 503);
 		}
 		case 'email.bounced':
 		case 'email.complained':
-			c.executionCtx.waitUntil(handleBounceOrComplaint(c.env, type, event.data));
+			// One D1 lookup (and update) per recipient: cheap enough to do before answering.
+			await handleBounceOrComplaint(c.env, type, event.data);
 			return c.json({ ok: true });
 		default:
 			return c.json({ ok: true, ignored: type });

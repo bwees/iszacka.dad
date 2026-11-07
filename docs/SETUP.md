@@ -14,12 +14,17 @@ After that, merging to `main` is the whole deploy process.
 
 You'll need:
 
-- A Cloudflare account. Workers Paid is effectively required for a public launch: several
-  products used here (Workflows, Browser Rendering, Durable Objects, D1) have tight free daily
-  limits, and when one runs out it stays out until 00:00 UTC. For scale: one open
-  `curl -N /api/stream` keeps the production Durable Object awake around the clock, which is about
-  10,800 of the Free plan's 13,000 GB-s a day, so leave headroom for other Durable Objects on the
-  account (preview streams are closed after a few minutes for this reason).
+- A Cloudflare account. The site is built to run on the **Workers Free** plan: every request,
+  cron run and Workflow step fits in its 10 ms of CPU (see "CPU budget (Workers Free)" in
+  [ARCHITECTURE.md](ARCHITECTURE.md#cpu-budget-workers-free)). The free daily limits still
+  apply, and when one runs out it stays out until 00:00 UTC: 100,000 Worker requests, 100,000
+  Durable Object requests (each counted check is one), 3,000 Workflow steps for the whole account
+  (an announcement takes about a dozen plus one per extra batch of recipients, an inbound email
+  four or five, the daily job four plus its post's announcement), and D1's reads and writes. For
+  scale: one open `curl -N /api/stream` keeps the production Durable Object awake around the
+  clock, which is about 10,800 of the Free plan's 13,000 GB-s a day, so leave headroom for other
+  Durable Objects on the account (preview streams are closed after a few minutes for this
+  reason). Workers Paid lifts all of this if the site ever gets popular.
 - A [Resend](https://resend.com) account, for email in both directions. The free plan is enough
   (see [Email limits](#email-limits)).
 - Admin access to the GitHub repository (`zackpollard/iszacka.dad`).
@@ -55,7 +60,7 @@ Account → Account API Tokens** (recommended: it belongs to the account rather 
 
 | Permission | Level | Why |
 |---|---|---|
-| Workers Scripts | Edit | Deploy the Worker and PR previews (and delete them), Worker secrets, the Durable Object, the Workflow (the Workflows API is covered by this permission), the rate limiters, the `workers.dev` subdomain lookup and attaching custom domains |
+| Workers Scripts | Edit | Deploy the Worker and PR previews (and delete them), Worker secrets, the Durable Object, the three Workflows (the Workflows API is covered by this permission), the rate limiters, the `workers.dev` subdomain lookup and attaching custom domains |
 | D1 | Edit | Find or create the `iszackadad` and `iszackadad_preview` databases, and apply migrations |
 | Account Settings | Read | Wrangler reads account details when it starts |
 | Turnstile | Edit | The Setup workflow finds or creates the Turnstile widget, and reads (or rotates) its secret (the API docs call this "Turnstile Sites Write") |
@@ -72,8 +77,8 @@ Account → Account API Tokens** (recommended: it belongs to the account rather 
 
 Things you don't need, so don't add them:
 
-- **Browser Rendering** (shown as "Browser Run" in newer dashboards): the Worker uses it through a
-  binding, which deploys with Workers Scripts: Edit alone.
+- **Browser Rendering** (shown as "Browser Run" in newer dashboards): nothing uses it. The social
+  cards are pre-rendered PNGs in `public/og/`.
 - Any of Cloudflare's own email permissions: email is Resend's job here.
 - **User Details** and **Memberships**: wrangler only needs them to discover your account, and
   CI tells it the account ID instead.
@@ -165,7 +170,7 @@ The site works at this point, but email doesn't yet: Resend doesn't know the dom
 points inbound mail at it. That's the next step.
 
 PR previews work from now on too: every pull request from a branch in this repository deploys
-`iszacka-dad-pr<N>` to `workers.dev`, with its own Workflow, the shared `iszackadad_preview`
+`iszacka-dad-pr<N>` to `workers.dev`, with its own Workflows, the shared `iszackadad_preview`
 database and Turnstile's test keys. Preview `/admin` uses the `PREVIEW_ADMIN_PASSWORD` repository
 secret (stored on each preview Worker as a secret, never printed); without it, preview admin is
 switched off. Previews are public on `workers.dev`, so never publish that password. Previews have
@@ -271,10 +276,10 @@ On a paid plan, raise `EMAIL_DAILY_LIMIT` in `wrangler.toml`.
 |---|---|
 | Deploy fails attaching a custom domain | A DNS record named `iszacka.dad` or `www` already exists. Delete it and re-run |
 | A preview can't find its `workers.dev` URL | The account has no `workers.dev` subdomain yet. Open Workers & Pages once to pick one |
-| "A workflow with this name already exists" | Something else owns that Workflow name. Previews rename theirs per PR; check nothing else uses `iszacka-dad-announce` |
+| "A workflow with this name already exists" | Something else owns that Workflow name. Previews rename theirs per PR; check nothing else uses `iszacka-dad-announce`, `iszacka-dad-inbound` or `iszacka-dad-daily` |
 | Setup says Resend can't list domains | `RESEND_API_KEY` is a sending-only key. Create a full-access one |
 | Setup says the domain is registered already | It's verified in another Resend team. Remove it there first |
-| No auto-reply to email | Check, in order: the Resend domain shows receiving verified; `dig +short MX iszacka.dad` shows only Resend's host; Resend's **Webhooks** page shows deliveries answered with 200 (401 means `RESEND_WEBHOOK_SECRET` is stale: run Setup with **force secrets**); the daily email limit isn't used up |
+| No auto-reply to email | Check, in order: the Resend domain shows receiving verified; `dig +short MX iszacka.dad` shows only Resend's host; Resend's **Webhooks** page shows deliveries answered with 200 (401 means `RESEND_WEBHOOK_SECRET` is stale: run Setup with **force secrets**); the `iszacka-dad-inbound` Workflow has an `inbound-<svix-id>` instance for the email, and its steps say what it decided (**Workers & Pages → Workflows**, or `npx wrangler workflows instances list iszacka-dad-inbound`); the daily email limit isn't used up |
 | `/admin` test email fails with `no_api_key` | `RESEND_API_KEY` isn't on the Worker. Set the GitHub secret and run the Deploy workflow |
 | Test email fails with `validation_error` | The Resend domain isn't verified yet. Run the Setup workflow and check its step 5 |
 | Forms say the robot check failed | `TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET_KEY` belong to different widgets. Run Setup with **force secrets** |

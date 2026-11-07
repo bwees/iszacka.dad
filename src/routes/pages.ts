@@ -6,17 +6,18 @@ import { Hono } from 'hono';
 import { html, raw } from 'hono/html';
 import { HTTPException } from 'hono/http-exception';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
-import { getReadiness, type Readiness } from '../lib/community';
+import { getReadinessSummary, type ReadinessSummary } from '../lib/community';
 import { getCheckTotal } from '../lib/counters';
+import { regionName } from '../lib/counters-geo';
 import { dadForecast, type ForecastDay } from '../lib/forecast';
 import { babySize, type BabySize } from '../lib/fruit';
 import { TRANSLATIONS, isRtl, negotiateTranslation, wordFor, type Translation } from '../lib/i18n';
-import { type Html, buildId, pageState, renderPage } from '../lib/layout';
-import { liveStats } from '../lib/live';
+import { type Html, buildId, fragmentCache, pageState, renderPage } from '../lib/layout';
+import { liveSnapshot } from '../lib/live';
 import { renderOgCardHtml } from '../lib/og-card';
 import { wantsJson } from '../lib/security';
 import { DAD, DOMAIN, PARENTS, SITE_NAME, STATUS_COPY, dnsAnswerName, siteUrl } from '../lib/site';
-import { daysBetween, formatLondon, formatLondonDate, isYmd, londonDate, londonHour } from '../lib/time';
+import { daysBetween, formatDayMonth, formatLondon, formatLondonDate, formatNumber, formatWeekday, isYmd, londonDate, londonHour } from '../lib/time';
 import { getSetting } from '../lib/state';
 import { getUpdate, listUpdates } from '../lib/updates';
 import { STATUSES, isStatus, type AppEnv, type SiteState, type Status, type Update, type UpdateKind } from '../types';
@@ -38,8 +39,18 @@ async function safe<T>(label: string, fn: () => Promise<T> | T, fallback: T): Pr
 	}
 }
 
+/** `safe` for synchronous, pure work (forecast, fruit), so a memoised fragment never waits. */
+function safeSync<T>(label: string, fn: () => T, fallback: T): T {
+	try {
+		return fn();
+	} catch (err) {
+		console.error(`home: ${label} failed:`, err);
+		return fallback;
+	}
+}
+
 export function formatCount(n: number): string {
-	return Number.isFinite(n) ? Math.max(0, Math.floor(n)).toLocaleString('en-GB') : '0';
+	return Number.isFinite(n) ? formatNumber(Math.max(0, Math.floor(n))) : '0';
 }
 
 const pad2 = (n: number) => String(n).padStart(2, '0');
@@ -149,12 +160,8 @@ export function geoFromRequest(request: Request): Geo {
 	let country: string | null = null;
 	if (code === 'T1') country = 'the Tor network';
 	else if (code && /^[A-Z]{2}$/.test(code) && code !== 'XX') {
-		try {
-			const name = new Intl.DisplayNames(['en-GB'], { type: 'region' }).of(code);
-			country = name && name !== code ? `${DEFINITE_COUNTRIES.has(code) ? 'the ' : ''}${name}` : null;
-		} catch {
-			country = null;
-		}
+		const name = regionName(code);
+		country = name ? `${DEFINITE_COUNTRIES.has(code) ? 'the ' : ''}${name}` : null;
 	}
 	return {
 		city: cleanGeoText(cf?.city),
@@ -180,15 +187,14 @@ export function withArticle(noun: string): string {
 const KIND_LABEL: Record<UpdateKind, string> = { status: 'Status change', daily: 'Daily bulletin', system: 'Notice' };
 const STATUS_BADGE: Record<Status, string> = { no: 'No', soon: 'Not yet', yes: 'Yes' };
 
-function personalCheckLines() {
-	return {
-		first: 'This is your first check. Welcome. It will not be your last.',
-		few: 'You have personally checked {n} times. Understandable.',
-		many: 'You have personally checked {n} times. Seek help.',
-		lots: 'You have personally checked {n} times. Seek help. Possibly professional.',
-		absurd: 'You have personally checked {n} times. Your next of kin have been notified.',
-	};
-}
+const PERSONAL_CHECK_LINES = {
+	first: 'This is your first check. Welcome. It will not be your last.',
+	few: 'You have personally checked {n} times. Understandable.',
+	many: 'You have personally checked {n} times. Seek help.',
+	lots: 'You have personally checked {n} times. Seek help. Possibly professional.',
+	absurd: 'You have personally checked {n} times. Your next of kin have been notified.',
+};
+let personalCheckLinesJson: string | undefined;
 
 /** The checks sentence tail for each status (the client swaps them on a live state change). */
 const CHECKS_TAIL: Record<Status, string> = {
@@ -273,19 +279,18 @@ pageRoutes.get('/', async (c) => {
 	const translation = negotiateTranslation(c.req.header('accept-language'));
 	const build = buildId(c.env);
 
-	const [stats, checks, updates, readiness] = await Promise.all([
-		safe('liveStats', () => liveStats(c.env), { viewers: 0, vibes: 0 }),
-		safe('checks', () => getCheckTotal(c.env), 0),
+	// One WaitingRoom RPC carries viewers, vibes and the check total; getCheckTotal (D1) only
+	// if the room couldn't answer.
+	const [stats, updates, readiness] = await Promise.all([
+		liveSnapshot(c.env),
 		safe('updates', () => listUpdates(c.env, { limit: 5 }), [] as Update[]),
-		safe<Readiness | null>('readiness', () => getReadiness(c.env), null),
+		safe<ReadinessSummary | null>('readiness', () => getReadinessSummary(c.env), null),
 	]);
-	const size = await safe<BabySize | null>('babySize', () => babySize(state.dueDate, today), null);
-	// Every status's forecast is rendered (all but the current one hidden), so a tab that sees
-	// the answer change live can swap panels without refetching the page.
-	const forecasts = Object.fromEntries(
-		await Promise.all(STATUSES.map(async (s) => [s, await safe<ForecastDay[]>('forecast', () => dadForecast(state.dueDate, today, s), [])] as const)),
-	) as Record<Status, ForecastDay[]>;
+	const checks = stats.checks ?? (await safe('checks', () => getCheckTotal(c.env), 0));
 	const clock = countdownCopy(state, now);
+	// The forecast and fruit panels only change with the status, the due date and the London
+	// date, so each isolate renders them once per combination (see fragmentCache).
+	const dayKey = `${status}|${state.dueDate ?? ''}|${today}`;
 
 	const hero = homeHero(state, translation, now);
 	const body = html`${hero}
@@ -334,11 +339,11 @@ pageRoutes.get('/', async (c) => {
 			`)}
 			${panel('you', '05', 'You', 'span-4', html`
 				<p class="big-number" data-personal-count>?</p>
-				<p data-personal-line data-lines="${JSON.stringify(personalCheckLines())}">We count how often you check, on your device only.</p>
+				<p data-personal-line data-lines="${(personalCheckLinesJson ??= JSON.stringify(PERSONAL_CHECK_LINES))}">We count how often you check, on your device only.</p>
 				<noscript><p class="tiny muted">Turn on JavaScript and we will count how often you check. For your own good.</p></noscript>
 			`)}
-			${panel('forecast', '06', '7-day dad forecast', 'span-12', statusVariants(status, (s) => forecastStrip(forecasts[s], today)))}
-			${panel('fruit', '07', 'Biometrics', 'span-4', statusVariants(status, (s) => fruitPanel(size, s)))}
+			${panel('forecast', '06', '7-day dad forecast', 'span-12', forecastPanel(dayKey, () => forecastVariants(state, today)))}
+			${panel('fruit', '07', 'Biometrics', 'span-4', fruitPanelCache(dayKey, () => fruitVariants(state, today)))}
 			${panel('ready', '08', 'Readiness', 'span-4', readinessPanel(readiness))}
 			${panel('vibes', '09', 'Morale', 'span-4', html`
 				<p class="big-number" data-live="vibes">${formatCount(stats.vibes)}</p>
@@ -368,7 +373,7 @@ pageRoutes.get('/', async (c) => {
 			`)}
 		</div>
 	</div>
-	${ticker(status)}
+	${tickerCache(status, () => ticker(status))}
 	<div class="wrap">
 		<section class="cta" aria-labelledby="cta-title">
 			<p class="kicker">Don't refresh. Subscribe.</p>
@@ -379,7 +384,7 @@ pageRoutes.get('/', async (c) => {
 	</div>
 </section>
 <div class="vibe-layer" data-vibe-layer aria-hidden="true"></div>
-${updateTemplate()}`;
+${updateTemplateCache('', updateTemplate)}`;
 
 	const res = await renderPage(c, {
 		title: `${SITE_NAME} ${copy.short}`,
@@ -428,6 +433,29 @@ function panel(id: string, channel: string, label: string, span: string, body: H
 </section>`;
 }
 
+const forecastPanel = fragmentCache();
+const fruitPanelCache = fragmentCache();
+const tickerCache = fragmentCache();
+const updateTemplateCache = fragmentCache();
+
+/**
+ * Every status's forecast (all but the current one hidden), so a tab that sees the answer
+ * change live can swap panels without refetching the page.
+ */
+function forecastVariants(state: SiteState, today: string): Html {
+	return statusVariants(state.status, (s) =>
+		forecastStrip(
+			safeSync<ForecastDay[]>('forecast', () => dadForecast(state.dueDate, today, s), []),
+			today,
+		),
+	);
+}
+
+function fruitVariants(state: SiteState, today: string): Html {
+	const size = safeSync<BabySize | null>('babySize', () => babySize(state.dueDate, today), null);
+	return statusVariants(state.status, (s) => fruitPanel(size, s));
+}
+
 function forecastStrip(days: ForecastDay[], today: string): Html {
 	if (!days.length) {
 		return html`<div class="empty">Forecast unavailable. Even the Met Office won't touch this one.</div>`;
@@ -437,14 +465,8 @@ function forecastStrip(days: ForecastDay[], today: string): Html {
 		d.setUTCDate(d.getUTCDate() + 1);
 		return d.toISOString().slice(0, 10);
 	})();
-	const dayName = (ymd: string) =>
-		ymd === today
-			? 'Today'
-			: ymd === tomorrow
-				? 'Tomorrow'
-				: new Intl.DateTimeFormat('en-GB', { weekday: 'short', timeZone: 'UTC' }).format(new Date(`${ymd}T12:00:00Z`));
-	const dayDate = (ymd: string) =>
-		isYmd(ymd) ? new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' }).format(new Date(`${ymd}T12:00:00Z`)) : '';
+	const dayName = (ymd: string) => (ymd === today ? 'Today' : ymd === tomorrow ? 'Tomorrow' : formatWeekday(ymd));
+	const dayDate = (ymd: string) => (isYmd(ymd) ? formatDayMonth(ymd) : '');
 	const pct = (p: number) => {
 		const v = Math.min(1, Math.max(0, Number.isFinite(p) ? p : 0)) * 100;
 		return v > 0 && v < 1 ? '<1%' : `${Math.round(v)}%`;
@@ -477,7 +499,7 @@ function fruitPanel(size: BabySize | null, status: Status): Html {
 	<p class="tiny muted mono">Week ${size.week}, day ${size.day} (estimated from the due date)</p>`;
 }
 
-function readinessPanel(r: Readiness | null): Html {
+function readinessPanel(r: ReadinessSummary | null): Html {
 	if (!r || r.total <= 0) {
 		return html`<div class="empty">Readiness unknown. The checklist is still being drawn up.</div>
 		<p><a href="/ready">Inspect the checklist <span aria-hidden="true">→</span></a></p>`;
@@ -490,15 +512,17 @@ function readinessPanel(r: Readiness | null): Html {
 }
 
 function ticker(status: Status): Html {
-	const items = (hidden: boolean) =>
+	// The list is rendered once and used twice (the second copy makes the scroll seamless).
+	const list = html`${TRANSLATIONS.map(
+		(t) => html`<li>${byStatus({ no: t.no, soon: t.notYet, yes: t.yes }, status, { lang: t.lang, className: 't-word' })}<span class="t-lang">${t.name}</span></li>`,
+	)}`;
+	const track = (hidden: boolean) =>
 		html`<ul class="ticker-track"${hidden ? raw(' aria-hidden="true"') : ''}>
-			${TRANSLATIONS.map(
-				(t) => html`<li>${byStatus({ no: t.no, soon: t.notYet, yes: t.yes }, status, { lang: t.lang, className: 't-word' })}<span class="t-lang">${t.name}</span></li>`,
-			)}
+			${list}
 		</ul>`;
 	return html`<section class="ticker" aria-label="The answer in ${TRANSLATIONS.length} languages">
 		<p class="ticker-label kicker"><span>The answer in ${TRANSLATIONS.length} languages</span></p>
-		<div class="ticker-viewport">${items(false)}${items(true)}</div>
+		<div class="ticker-viewport">${track(false)}${track(true)}</div>
 	</section>`;
 }
 
@@ -568,7 +592,7 @@ pageRoutes.get('/updates', async (c) => {
 		${older ? html`<a class="btn" href="/updates?before=${older.id}" rel="next">Older updates →</a>` : ''}
 	</nav>
 </div>
-${firstPage ? updateTemplate() : ''}`;
+${firstPage ? updateTemplateCache('', updateTemplate) : ''}`;
 
 	return renderPage(c, {
 		title: firstPage ? 'Updates' : 'Older updates',

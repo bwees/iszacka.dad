@@ -1,35 +1,30 @@
 import { createHmac, randomBytes } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-// The inbound handler and the subscriber/quota writes are spied on; the route, the svix
+// The subscriber writes are spied on and the INBOUND binding is a fake; the route, the svix
 // verification, the dedupe and the sender normalisation are the real thing.
 const mocks = vi.hoisted(() => ({
-	handleInboundEmail: vi.fn(async () => {}),
 	disableSubscriberByEmail: vi.fn(async () => true),
-	recordEmailSend: vi.fn(async () => {}),
 }));
 vi.mock('../src/lib/state', () => ({ getState: vi.fn(), getOrCreateSetting: vi.fn() }));
 vi.mock('../src/lib/live', () => ({ liveStats: vi.fn() }));
 vi.mock('../src/lib/counters', () => ({ getCheckTotal: vi.fn() }));
 vi.mock('../src/lib/pool', () => ({ parseGuessText: vi.fn(), submitGuess: vi.fn() }));
-vi.mock('../src/email-handler', async (importOriginal) => ({
-	...(await importOriginal<typeof import('../src/email-handler')>()),
-	handleInboundEmail: mocks.handleInboundEmail,
-}));
 vi.mock('../src/notify/email', async (importOriginal) => ({
 	...(await importOriginal<typeof import('../src/notify/email')>()),
 	disableSubscriberByEmail: mocks.disableSubscriberByEmail,
-	recordEmailSend: mocks.recordEmailSend,
 }));
 
 const {
+	INBOUND_SUCCESS_RETENTION,
 	MAX_SKEW_SECONDS,
 	claimResendEvent,
+	inboundInstanceId,
+	inboundParams,
 	purgeResendEvents,
 	releaseResendEvent,
 	resendWebhookRoutes,
 	signSvixPayload,
-	toInboundEmail,
 	verifySvixSignature,
 } = await import('../src/routes/resend-webhook');
 
@@ -87,45 +82,25 @@ describe('svix signatures', () => {
 	});
 });
 
-describe('toInboundEmail', () => {
-	const received = {
-		id: 'e1',
-		from: 'Alex Example <Alex@Example.com>',
-		subject: 'guess',
-		text: '14 Nov 15:30',
-		headers: { from: 'Alex Example <Alex@Example.com>', references: ['<a@x>', '<b@x>'] },
-		message_id: '<m@x>',
-	};
-
-	it("prefers the webhook's bare data.from, lower-cased", () => {
-		expect(toInboundEmail({ from: 'Sender@Example.org' }, received).from).toBe('sender@example.org');
+describe('handing off to the InboundWorkflow', () => {
+	it("passes the email id, the webhook's sender as a bare, lower-cased address, and the svix-id", () => {
+		expect(inboundParams({ email_id: 'e1', from: 'Sender@Example.org' }, 'msg_1')).toEqual({
+			emailId: 'e1',
+			from: 'sender@example.org',
+			svixId: 'msg_1',
+		});
+		expect(inboundParams({ email_id: 'e1', from: 'Alex Example <Alex@Example.com>' }, 'msg_1').from).toBe('alex@example.com');
+		expect(inboundParams({}, 'msg_1')).toEqual({ emailId: '', from: '', svixId: 'msg_1' });
+		expect(inboundParams({ email_id: 7, from: ['x'] } as never, 'msg_1')).toEqual({ emailId: '', from: '', svixId: 'msg_1' });
 	});
 
-	it("falls back to the retrieved email's From, reduced to the bare address", () => {
-		expect(toInboundEmail({}, received).from).toBe('alex@example.com');
-		expect(toInboundEmail({ from: '' }, received).from).toBe('alex@example.com');
-	});
-
-	it('never carries a display name, and joins repeated headers', () => {
-		const inbound = toInboundEmail({ from: 'alex@example.com' }, received);
-		expect(Object.keys(inbound)).not.toContain('fromName');
-		expect(inbound.references).toBe('<a@x> <b@x>');
-		expect(inbound.messageId).toBe('<m@x>');
-	});
-
-	it("carries Resend's authentication verdicts, and never trusts forged headers", async () => {
-		const { senderAuthenticated } = await import('../src/email-handler');
-		const signed = toInboundEmail({}, { ...received, authentication: { spf: 'pass', dkim: 'pass', dmarc: 'gray' } });
-		expect(signed.authentication).toEqual({ spf: 'pass', dkim: 'pass', dmarc: 'gray' });
-		expect(signed.id).toBe('e1');
-		expect(senderAuthenticated(signed.authentication)).toBe(true);
-
-		const forged = toInboundEmail(
-			{},
-			{ ...received, headers: { ...received.headers, 'authentication-results': 'mx.example.com; dkim=pass; dmarc=pass' } },
-		);
-		expect(forged.authentication).toBeNull();
-		expect(senderAuthenticated(forged.authentication)).toBe(false);
+	it('names the instance after the svix-id, hashing ids Workflows would refuse', async () => {
+		expect(await inboundInstanceId('msg_2abcDEF-x')).toBe('inbound-msg_2abcDEF-x');
+		const odd = await inboundInstanceId('msg with spaces/and=signs');
+		expect(odd).toMatch(/^inbound-h[0-9a-f]{40}$/);
+		expect(await inboundInstanceId('msg with spaces/and=signs')).toBe(odd);
+		expect(await inboundInstanceId('m'.repeat(150))).toMatch(/^inbound-h[0-9a-f]{40}$/);
+		expect(await inboundInstanceId('m'.repeat(92))).toMatch(/^inbound-m{92}$/);
 	});
 });
 
@@ -181,16 +156,46 @@ function fakeDb() {
 	};
 }
 
+/** The INBOUND Workflow binding: instances by id, with switchable failures. */
+function fakeWorkflow() {
+	const instances = new Map<string, { params: unknown; retention?: unknown }>();
+	const control = { createFails: false, getFails: false };
+	return {
+		instances,
+		control,
+		create: vi.fn(async (opts: { id: string; params: unknown; retention?: unknown }) => {
+			if (control.createFails) throw new Error('internal error');
+			if (instances.has(opts.id)) throw new Error('instance.already_exists');
+			instances.set(opts.id, { params: opts.params, retention: opts.retention });
+			return { id: opts.id };
+		}),
+		get: vi.fn(async (id: string) => {
+			if (control.getFails || !instances.has(id)) throw new Error('instance.not_found');
+			return { id };
+		}),
+	};
+}
+
 function setup(opts: { secret?: string | null } = {}) {
 	const db = fakeDb();
+	const workflow = fakeWorkflow();
 	const env = {
 		DB: db,
+		INBOUND: workflow,
 		RESEND_WEBHOOK_SECRET: opts.secret === null ? undefined : (opts.secret ?? SECRET),
 		RESEND_API_KEY: 're_test_key',
 		RESEND_API_BASE: 'https://resend.test',
 	} as unknown as Env;
 	const pending: Promise<unknown>[] = [];
-	const ctx = { waitUntil: (p: Promise<unknown>) => pending.push(p), passThroughOnException: () => {}, props: {} } as unknown as ExecutionContext;
+	let waitUntilCalls = 0;
+	const ctx = {
+		waitUntil: (p: Promise<unknown>) => {
+			waitUntilCalls++;
+			pending.push(p);
+		},
+		passThroughOnException: () => {},
+		props: {},
+	} as unknown as ExecutionContext;
 	const post = async (event: unknown, headers: { id?: string; signature?: string; timestamp?: string } = {}) => {
 		const body = JSON.stringify(event);
 		const id = headers.id ?? `msg_${randomBytes(6).toString('hex')}`;
@@ -213,7 +218,7 @@ function setup(opts: { secret?: string | null } = {}) {
 		await Promise.all(pending.splice(0));
 		return { status: res.status, json: (await res.json()) as Record<string, unknown> };
 	};
-	return { env, db, post };
+	return { env, db, workflow, post, waitUntilCalls: () => waitUntilCalls };
 }
 
 const received = (from = 'alex@example.com') => ({
@@ -226,37 +231,27 @@ describe('POST /api/resend/webhook', () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
 		vi.unstubAllGlobals();
+		// The request itself never talks to Resend.
 		vi.stubGlobal(
 			'fetch',
-			vi.fn(async (url: string, init?: RequestInit) => {
-				expect(url).toBe('https://resend.test/emails/receiving/e-123');
-				expect(new Headers(init?.headers).get('user-agent')).toMatch(/iszacka\.dad/);
-				return Response.json({
-					object: 'email',
-					id: 'e-123',
-					from: 'Alex Example <Alex@Example.com>',
-					subject: 'Well?',
-					text: 'Is Zack a dad yet?',
-					html: null,
-					headers: { from: 'Alex Example <Alex@Example.com>' },
-					message_id: '<m@example.com>',
-				});
+			vi.fn(async () => {
+				throw new Error('the webhook must not fetch anything');
 			}),
 		);
 	});
 
 	it('is 503 until RESEND_WEBHOOK_SECRET is set', async () => {
-		const { post } = setup({ secret: null });
+		const { post, workflow } = setup({ secret: null });
 		expect((await post(received())).status).toBe(503);
-		expect(mocks.handleInboundEmail).not.toHaveBeenCalled();
+		expect(workflow.create).not.toHaveBeenCalled();
 	});
 
 	it('is 401 for a bad signature, and records nothing', async () => {
-		const { post, db } = setup();
+		const { post, db, workflow } = setup();
 		const res = await post(received(), { signature: `v1,${Buffer.alloc(32).toString('base64')}` });
 		expect(res.status).toBe(401);
 		expect(db.events.size).toBe(0);
-		expect(mocks.handleInboundEmail).not.toHaveBeenCalled();
+		expect(workflow.create).not.toHaveBeenCalled();
 	});
 
 	it('is 401 for a stale timestamp', async () => {
@@ -265,130 +260,94 @@ describe('POST /api/resend/webhook', () => {
 		expect((await post(received(), { timestamp: stale })).status).toBe(401);
 	});
 
-	it('handles email.received with the bare sender from data.from, and counts it', async () => {
-		const { post, db } = setup();
-		const res = await post(received('Alex@Example.com'));
-		expect(res).toEqual({ status: 200, json: { ok: true } });
-		expect(mocks.recordEmailSend).toHaveBeenCalledTimes(1);
-		expect(mocks.handleInboundEmail).toHaveBeenCalledTimes(1);
-		const [inbound] = mocks.handleInboundEmail.mock.calls[0] as unknown as [{ from: string; subject: string; text: string }];
-		expect(inbound).toMatchObject({ from: 'alex@example.com', subject: 'Well?', text: 'Is Zack a dad yet?' });
-		expect(JSON.stringify(inbound)).not.toContain('fromName');
+	it('hands email.received to the InboundWorkflow and answers straight away', async () => {
+		const { post, db, workflow, waitUntilCalls } = setup();
+		const res = await post(received('Alex@Example.com'), { id: 'msg_abc123' });
+		expect(res).toMatchObject({ status: 200, json: { ok: true } });
+		expect(workflow.create).toHaveBeenCalledTimes(1);
+		expect(workflow.create).toHaveBeenCalledWith({
+			id: 'inbound-msg_abc123',
+			params: { emailId: 'e-123', from: 'alex@example.com', svixId: 'msg_abc123' },
+			retention: { successRetention: INBOUND_SUCCESS_RETENTION },
+		});
 		expect([...db.events.values()]).toEqual([{ type: 'email.received', at: expect.any(String) }]);
+		expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+		// Nothing left running after the response: no waitUntil work at all.
+		expect(waitUntilCalls()).toBe(0);
 	});
 
-	it('acknowledges a duplicate svix-id without processing it again', async () => {
-		const { post, db } = setup();
+	it('acknowledges a duplicate svix-id without starting anything again', async () => {
+		const { post, db, workflow } = setup();
 		const first = await post(received(), { id: 'msg_same' });
 		const again = await post(received(), { id: 'msg_same' });
 		expect(first.json).toEqual({ ok: true });
-		expect(again).toEqual({ status: 200, json: { ok: true, duplicate: true } });
-		expect(mocks.handleInboundEmail).toHaveBeenCalledTimes(1);
-		expect(mocks.recordEmailSend).toHaveBeenCalledTimes(1);
+		expect(again).toMatchObject({ status: 200, json: { ok: true, duplicate: true } });
+		expect(workflow.create).toHaveBeenCalledTimes(1);
 		expect(db.events.size).toBe(1);
 	});
 
-	it('fetches the received email with a timeout, inside the request', async () => {
-		const { post } = setup();
-		await post(received());
-		const [, init] = vi.mocked(fetch).mock.calls[0] as [string, RequestInit];
-		expect(init.signal).toBeInstanceOf(AbortSignal);
+	it('starts an instance even without an email_id (it records and counts the email)', async () => {
+		const { post, workflow } = setup();
+		const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+		const event = received();
+		expect((await post({ ...event, data: { ...event.data, email_id: undefined } }, { id: 'msg_noid' })).status).toBe(200);
+		expect(workflow.instances.get('inbound-msg_noid')?.params).toEqual({ emailId: '', from: 'alex@example.com', svixId: 'msg_noid' });
+		errors.mockRestore();
 	});
 
-	describe('when fetching the received email fails', () => {
-		const ok = () =>
-			Response.json({ object: 'email', id: 'e-123', subject: 'Well?', text: 'Is Zack a dad yet?', headers: {}, message_id: '<m@example.com>' });
-
-		const transient: [string, () => Promise<Response>][] = [
-			['a 429', async () => Response.json({ name: 'rate_limit_exceeded' }, { status: 429, headers: { 'Retry-After': '1' } })],
-			['a 500', async () => new Response('upstream error', { status: 500 })],
-			['a 503', async () => new Response('unavailable', { status: 503 })],
-			['a network error', async () => Promise.reject(new TypeError('Network connection lost'))],
-			['a timeout', async () => Promise.reject(new DOMException('The operation was aborted due to timeout', 'TimeoutError'))],
-		];
-
-		it.each(transient)('answers 503 for %s, releases the svix-id and handles the redelivery once', async (_label, fail) => {
-			const { post, db } = setup();
+	describe('when the workflow instance cannot be started', () => {
+		it('answers 503, releases the svix-id and starts it on the redelivery', async () => {
+			const { post, db, workflow } = setup();
 			const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
-			vi.stubGlobal('fetch', vi.fn(fail));
+			workflow.control.createFails = true;
 
 			const first = await post(received(), { id: 'msg_retry' });
-			expect(first).toEqual({ status: 503, json: { ok: false, error: 'try again later' } });
+			expect(first).toMatchObject({ status: 503, json: { ok: false, error: 'try again later' } });
 			expect(db.events.has('msg_retry')).toBe(false);
-			expect(mocks.recordEmailSend).not.toHaveBeenCalled();
-			expect(mocks.handleInboundEmail).not.toHaveBeenCalled();
+			expect(workflow.instances.size).toBe(0);
 
 			// Resend redelivers the same svix-id (re-signed with a fresh timestamp).
-			vi.stubGlobal('fetch', vi.fn(async () => ok()));
+			workflow.control.createFails = false;
 			const again = await post(received(), { id: 'msg_retry' });
-			expect(again).toEqual({ status: 200, json: { ok: true } });
+			expect(again).toMatchObject({ status: 200, json: { ok: true } });
 			expect(db.events.has('msg_retry')).toBe(true);
-			expect(mocks.recordEmailSend).toHaveBeenCalledTimes(1);
-			expect(mocks.handleInboundEmail).toHaveBeenCalledTimes(1);
+			expect([...workflow.instances.keys()]).toEqual(['inbound-msg_retry']);
 
 			// A third copy is a plain duplicate.
 			expect((await post(received(), { id: 'msg_retry' })).json).toEqual({ ok: true, duplicate: true });
-			expect(mocks.handleInboundEmail).toHaveBeenCalledTimes(1);
+			expect(workflow.create).toHaveBeenCalledTimes(2);
 			errors.mockRestore();
+		});
+
+		it('treats an instance that already exists as started', async () => {
+			const { post, db, workflow } = setup();
+			// An earlier delivery created it, then its claim was released (say, a timeout after create).
+			workflow.instances.set('inbound-msg_exists', { params: {} });
+			expect(await post(received(), { id: 'msg_exists' })).toMatchObject({ status: 200, json: { ok: true } });
+			expect(workflow.get).toHaveBeenCalledWith('inbound-msg_exists');
+			expect(db.events.has('msg_exists')).toBe(true);
 		});
 
 		it('still answers 503 if the claim cannot be released, and says so in the log', async () => {
-			const { post, db } = setup();
+			const { post, db, workflow } = setup();
 			const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
-			vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 502 })));
+			workflow.control.createFails = true;
 			db.breakDeletes();
 			expect((await post(received(), { id: 'msg_stuck' })).status).toBe(503);
 			expect(errors.mock.calls.some(([msg]) => String(msg).includes('could not release the event'))).toBe(true);
-			expect(mocks.handleInboundEmail).not.toHaveBeenCalled();
-			errors.mockRestore();
-		});
-
-		it.each([
-			['a 404', 404],
-			['a 403', 403],
-			['a 422', 422],
-		])('keeps the claim and answers 200 for %s (permanent), counting the email once', async (_label, status) => {
-			const { post, db } = setup();
-			const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
-			vi.stubGlobal('fetch', vi.fn(async () => Response.json({ name: 'not_found' }, { status })));
-			const res = await post(received(), { id: 'msg_gone' });
-			expect(res).toEqual({ status: 200, json: { ok: true } });
-			expect(db.events.has('msg_gone')).toBe(true);
-			expect(mocks.recordEmailSend).toHaveBeenCalledTimes(1);
-			expect(mocks.handleInboundEmail).not.toHaveBeenCalled();
-			expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
-			errors.mockRestore();
-		});
-
-		it('keeps the claim and answers 200 without an email_id or an API key', async () => {
-			const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
-			const noId = setup();
-			const event = received();
-			const res = await noId.post({ ...event, data: { ...event.data, email_id: undefined } });
-			expect(res.status).toBe(200);
-			expect(noId.db.events.size).toBe(1);
-
-			const noKey = setup();
-			(noKey.env as unknown as { RESEND_API_KEY?: string }).RESEND_API_KEY = undefined;
-			expect((await noKey.post(received())).status).toBe(200);
-			expect(noKey.db.events.size).toBe(1);
-
-			expect(vi.mocked(fetch)).not.toHaveBeenCalled();
-			expect(mocks.recordEmailSend).toHaveBeenCalledTimes(2);
-			expect(mocks.handleInboundEmail).not.toHaveBeenCalled();
 			errors.mockRestore();
 		});
 	});
 
 	it('answers 500 (so Resend retries) if the dedupe table cannot be written', async () => {
-		const { post, db } = setup();
+		const { post, db, workflow } = setup();
 		db.breakIt();
 		expect((await post(received())).status).toBe(500);
-		expect(mocks.handleInboundEmail).not.toHaveBeenCalled();
+		expect(workflow.create).not.toHaveBeenCalled();
 	});
 
-	it('unsubscribes bounced and complaining recipients, by bare address', async () => {
-		const { post } = setup();
+	it('unsubscribes bounced and complaining recipients, by bare address, before answering', async () => {
+		const { post, waitUntilCalls } = setup();
 		const bounced = await post({
 			type: 'email.bounced',
 			data: { email_id: 'x', to: ['Someone <Someone@Example.com>'], bounce: { type: 'Permanent', subType: 'Suppressed' } },
@@ -398,6 +357,14 @@ describe('POST /api/resend/webhook', () => {
 
 		await post({ type: 'email.complained', data: { email_id: 'y', to: ['other@example.com'] } });
 		expect(mocks.disableSubscriberByEmail).toHaveBeenLastCalledWith(expect.anything(), 'other@example.com');
+		expect(waitUntilCalls()).toBe(0);
+	});
+
+	it('looks at no more than 10 recipients of a bounce, and skips junk', async () => {
+		const { post } = setup();
+		const to = [7, 'not an address', ...Array.from({ length: 20 }, (_, i) => `r${i}@example.com`)];
+		expect((await post({ type: 'email.bounced', data: { email_id: 'x', to, bounce: { type: 'Permanent' } } })).status).toBe(200);
+		expect(mocks.disableSubscriberByEmail).toHaveBeenCalledTimes(8);
 	});
 
 	it('leaves subscribers alone after a temporary bounce', async () => {
@@ -407,10 +374,10 @@ describe('POST /api/resend/webhook', () => {
 	});
 
 	it('ignores other events with a 200', async () => {
-		const { post } = setup();
+		const { post, workflow } = setup();
 		const res = await post({ type: 'email.delivered', data: { email_id: 'z' } });
-		expect(res).toEqual({ status: 200, json: { ok: true, ignored: 'email.delivered' } });
-		expect(mocks.handleInboundEmail).not.toHaveBeenCalled();
+		expect(res).toMatchObject({ status: 200, json: { ok: true, ignored: 'email.delivered' } });
+		expect(workflow.create).not.toHaveBeenCalled();
 	});
 
 	it('is 400 for a signed body that is not JSON', async () => {

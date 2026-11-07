@@ -8,9 +8,10 @@
 
 The answer is **NO**. Then, briefly, **NOT YET** (it's happening). Then **YES**. That's three
 states and one bit of genuinely interesting information, so naturally it runs on a Cloudflare
-Worker with a database, a Durable Object, a durable Workflow, a headless browser, a
-cryptographically signed hash chain, an MCP server and a DNS record. A static page with the
-word "no" on it would have been fine. It would also have been much less fun.
+Worker with a database, a Durable Object, three durable Workflows, a cryptographically signed
+hash chain, an MCP server and a DNS record, all squeezed into the Workers Free plan's 10 ms of
+CPU per request. A static page with the word "no" on it would have been fine. It would also have
+been much less fun.
 
 ```console
 $ curl iszacka.dad
@@ -62,7 +63,7 @@ $ curl -i https://iszacka.dad/api/dad        # HTTP/1.1 425 Too Early
   (moderated)
 - A printable Certificate of Dadhood, and a printable fridge poster with a QR code
 - Easter eggs, and a greeting for wherever you're checking from
-- Live Open Graph images, rendered with Browser Rendering
+- Open Graph cards for each answer, versioned so link previews flip with it
 - A durable notification Workflow with a 60-second undo window and a delivery log
 - An admin panel with the big red button
 - Turnstile and rate limits on every form; CSP and HSTS everywhere
@@ -83,26 +84,39 @@ flowchart LR
     hono[Hono routes:<br/>pages, API, feeds, MCP, admin]
   end
   worker --> d1[(D1: state, history,<br/>subscribers, ledger)]
-  worker --> room[Durable Object:<br/>WaitingRoom<br/>WebSockets + SSE]
+  worker --> room[Durable Object:<br/>WaitingRoom<br/>WebSockets + SSE + check counts]
   worker --> flow[Workflow:<br/>AnnounceWorkflow]
+  worker --> inbound[Workflow:<br/>InboundWorkflow]
+  worker --> daily[Workflow:<br/>DailyWorkflow]
+  daily --> flow
+  inbound -->|fetch + reply| resend
+  flow --> room
+  flow --> ledger[Dad Ledger]
   flow -->|email| resend
   flow --> push[Web push]
   flow --> hooks[Webhooks]
   flow --> dns[DNS TXT record]
-  flow --> og[Browser Rendering:<br/>OG image]
 ```
 
 - **Status model.** `no` → `soon` (labour has started) → `yes`. The admin flips it. That writes
-  the history and the Dad Ledger, broadcasts to every open tab, and starts `AnnounceWorkflow`.
-- **Notifications** wait out a 60-second undo window, then go out in batches (email, push,
-  webhooks), each a retried, durable step that skips anyone it already reached, then update the
-  DNS record and the OG image. If the day's email quota runs out mid-announcement, the Workflow
-  sleeps until it resets at midnight UTC and carries on.
+  the status, its history and the update in one D1 batch and starts `AnnounceWorkflow`, whose
+  first steps broadcast to every open tab, sign the change into the Dad Ledger and update the DNS
+  record.
+- **Notifications** wait out a 60-second undo window, then go out in batches (push, webhooks,
+  then email through Resend's batch API), each a retried, durable step that skips anyone it
+  already reached. If the day's email quota runs out mid-announcement, the Workflow sleeps until
+  it resets at midnight UTC and carries on.
 - **Inbound email** arrives at Resend, which posts a signed webhook to `/api/resend/webhook`; the
-  Worker checks the signature, ignores repeats, and auto-replies with the answer (or enters a baby
-  pool guess).
+  Worker checks the signature, ignores repeats and starts an `InboundWorkflow`, which fetches the
+  email and auto-replies with the answer (or enters a baby pool guess).
+- **The daily cron** only starts that day's `DailyWorkflow`: the "Day N: still no." post, a DNS
+  re-sync and some tidying, one step each.
 - **Live updates** come from a single `WaitingRoom` Durable Object holding every WebSocket and
-  SSE client.
+  SSE client. It also tallies the check counters and writes them to D1 in batches.
+- **CPU budget.** It runs on Workers Free, where a request, a cron run and each Workflow step
+  get 10 ms of CPU. Anything heavy is a Workflow step, nothing renders in a headless browser
+  (the social cards are pre-rendered PNGs), and nothing starts up ICU on a hot path. The rules
+  are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#cpu-budget-workers-free).
 - **Abuse protection**: rate limits on everything public, Turnstile on forms, and HTML that is
   escaped by construction (`hono/html`) behind a CSP that blocks inline scripts.
 - **Privacy**: the site knows the status, when it changed, and the due date. That's it. No names,
@@ -114,11 +128,11 @@ src/
   routes/            one Hono router per feature area
   lib/               state, security, layout, feeds, ledger, pool, ...
   do/                the WaitingRoom Durable Object
-  workflows/         AnnounceWorkflow
+  workflows/         AnnounceWorkflow, InboundWorkflow, DailyWorkflow
   notify/            email, push, webhooks, DNS
 public/              static assets (CSS, client JS, service worker, icons)
 migrations/          D1 schema
-scripts/             smoke.sh, setup-cloudflare.sh
+scripts/             smoke.sh, setup-cloudflare.sh, og-render.ts (the social cards)
 test/                vitest unit tests
 .github/             CI, deploys and PR previews
 ```

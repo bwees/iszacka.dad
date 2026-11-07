@@ -18,7 +18,7 @@
 import type { SiteState } from '../types';
 import { DOMAIN } from './site';
 import { getState } from './state';
-import { TZ, addDays, formatLondon, formatLondonDate, isYmd, londonDate, nowIso } from './time';
+import { TZ, addDays, dateTimeFormat, formatLondon, formatLondonDate, isYmd, londonDate, londonOffsetMs, nowIso } from './time';
 
 export interface GuessInput {
 	name: string;
@@ -232,7 +232,7 @@ export interface LocalDateTime {
 	minute: number;
 }
 
-const partsFormatter = new Intl.DateTimeFormat('en-GB', {
+const PARTS_OPTIONS: Intl.DateTimeFormatOptions = {
 	timeZone: TZ,
 	year: 'numeric',
 	month: '2-digit',
@@ -241,12 +241,25 @@ const partsFormatter = new Intl.DateTimeFormat('en-GB', {
 	minute: '2-digit',
 	second: '2-digit',
 	hourCycle: 'h23',
-});
+};
 
 /** London wall-clock fields for an instant. */
 export function londonParts(ms: number): LocalDateTime & { second: number } {
+	// The GMT/BST rule covers every date the pool can see; Intl (tzdata) handles the rest.
+	const offset = londonOffsetMs(ms);
+	if (offset !== null) {
+		const d = new Date(ms + offset);
+		return {
+			year: d.getUTCFullYear(),
+			month: d.getUTCMonth() + 1,
+			day: d.getUTCDate(),
+			hour: d.getUTCHours(),
+			minute: d.getUTCMinutes(),
+			second: d.getUTCSeconds(),
+		};
+	}
 	const map: Record<string, number> = {};
-	for (const part of partsFormatter.formatToParts(new Date(ms))) {
+	for (const part of dateTimeFormat('en-GB', PARTS_OPTIONS).formatToParts(new Date(ms))) {
 		if (part.type !== 'literal') map[part.type] = Number(part.value);
 	}
 	return {
@@ -689,6 +702,14 @@ export function describeOffset(offsetMs: number): string {
  * the earlier entry) and the closest is crowned. Otherwise in guess order, with
  * guesses already in the past marked eliminated.
  */
+/**
+ * Plain code-unit order. The strings compared here are ISO timestamps and dates, where it is
+ * the same as localeCompare's, without waking up ICU (milliseconds on a fresh isolate).
+ */
+function compareStrings(a: string, b: string): number {
+	return a < b ? -1 : a > b ? 1 : 0;
+}
+
 export function buildLeaderboard(guesses: GuessRecord[], state: SiteState, now: string): Leaderboard {
 	const visible = guesses.filter((g) => !g.hidden && Number.isFinite(Date.parse(g.guessAt)));
 	const nowMs = Date.parse(now);
@@ -700,7 +721,7 @@ export function buildLeaderboard(guesses: GuessRecord[], state: SiteState, now: 
 			.sort(
 				(a, b) =>
 					Math.abs(a.offset) - Math.abs(b.offset) ||
-					a.g.createdAt.localeCompare(b.g.createdAt) ||
+					compareStrings(a.g.createdAt, b.g.createdAt) ||
 					a.g.id - b.g.id,
 			)
 			.map(({ g, offset }, i): LeaderboardEntry => ({
@@ -759,7 +780,7 @@ export function guessHistogram(guesses: Array<Pick<GuessRecord, 'guessAt'>>, inc
 	const last = days[days.length - 1] as string;
 	const span = Math.round((Date.parse(`${last}T00:00:00Z`) - Date.parse(`${first}T00:00:00Z`)) / DAY_MS) + 1;
 	if (span > HISTOGRAM_MAX_DAYS) {
-		return [...counts.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([date, count]) => ({ date, count }));
+		return [...counts.entries()].sort(([a], [b]) => compareStrings(a, b)).map(([date, count]) => ({ date, count }));
 	}
 	return Array.from({ length: span }, (_, i) => {
 		const date = addDays(first, i);

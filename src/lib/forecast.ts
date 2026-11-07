@@ -20,7 +20,7 @@
 // ~95% today. `yes` means clear skies forever.
 
 import type { Status } from '../types';
-import { addDays, daysBetween, isYmd } from './time';
+import { addDays, daysBetween, isYmd, londonDate } from './time';
 
 export interface ForecastDay {
 	/** 'YYYY-MM-DD' (Europe/London). */
@@ -183,11 +183,9 @@ export interface DayStatus {
 
 export const UPTIME_DAYS = 90;
 
-const londonDay = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/London', year: 'numeric', month: '2-digit', day: '2-digit' });
-
 function londonYmd(iso: string): string | null {
 	const ms = Date.parse(iso);
-	return Number.isFinite(ms) ? londonDay.format(new Date(ms)) : null;
+	return Number.isFinite(ms) ? londonDate(new Date(ms)) : null;
 }
 
 /** Valid history entries, oldest first. */

@@ -1,102 +1,111 @@
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { Hono } from 'hono';
 import { describe, expect, it } from 'vitest';
-import { blobToBytes, describeLaunchFailure, isOgImageUsable, isPng, OG_MAX_AGE_MS } from '../src/lib/og';
+import { ogImageUrl } from '../src/lib/layout';
+import { ogCardPath, ogVersionStatus } from '../src/lib/og';
 import { ledgerRoutes } from '../src/routes/ledger';
-import type { AppEnv } from '../src/types';
+import { STATUSES, type AppEnv, type Status } from '../src/types';
 
 const PNG_HEADER = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 
-describe('blobToBytes', () => {
-	it('accepts the number[] D1 returns for BLOBs', () => {
-		expect(blobToBytes([1, 2, 3])).toEqual(new Uint8Array([1, 2, 3]));
-	});
-
-	it('accepts ArrayBuffer and Uint8Array', () => {
-		expect(blobToBytes(new Uint8Array([4, 5]).buffer)).toEqual(new Uint8Array([4, 5]));
-		const bytes = new Uint8Array([6]);
-		expect(blobToBytes(bytes)).toBe(bytes);
-	});
-
-	it('rejects anything else', () => {
-		expect(blobToBytes('png')).toBeNull();
-		expect(blobToBytes(null)).toBeNull();
-		expect(blobToBytes([1, 'two'])).toBeNull();
+describe('pre-rendered cards', () => {
+	it.each(STATUSES)('public/og/%s.png exists and is a PNG', (status) => {
+		const file = join(__dirname, '..', 'public', ogCardPath(status));
+		expect(existsSync(file)).toBe(true);
+		expect([...readFileSync(file).subarray(0, 8)]).toEqual(PNG_HEADER);
 	});
 });
 
-describe('isPng', () => {
-	it('recognises the PNG signature', () => {
-		expect(isPng(new Uint8Array([...PNG_HEADER, 0, 0, 0, 13]))).toBe(true);
+describe('ogVersionStatus', () => {
+	it('reads the status back out of every og:image URL the layout writes', () => {
+		for (const status of STATUSES) {
+			for (const statusChangedAt of ['2026-11-20T03:14:00.000Z', '', 'nope']) {
+				const v = new URL(ogImageUrl('https://iszacka.dad', { status, statusChangedAt })).searchParams.get('v');
+				expect(ogVersionStatus(v), `${status} ${statusChangedAt}`).toBe(status);
+			}
+		}
 	});
 
-	it('rejects other bytes and bare signatures', () => {
-		expect(isPng(new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0]))).toBe(false);
-		expect(isPng(new Uint8Array(PNG_HEADER))).toBe(false);
-	});
-});
-
-describe('isOgImageUsable', () => {
-	const now = Date.parse('2026-11-06T12:00:00.000Z');
-
-	it('serves a fresh render of the current status', () => {
-		expect(isOgImageUsable({ status: 'no', createdAt: '2026-11-06T11:00:00.000Z' }, 'no', now)).toBe(true);
-	});
-
-	it('refuses a render of a different status', () => {
-		expect(isOgImageUsable({ status: 'no', createdAt: '2026-11-06T11:59:00.000Z' }, 'yes', now)).toBe(false);
-	});
-
-	it('refuses a render 48 hours old or older', () => {
-		const justInside = new Date(now - OG_MAX_AGE_MS + 1000).toISOString();
-		const justOutside = new Date(now - OG_MAX_AGE_MS).toISOString();
-		expect(isOgImageUsable({ status: 'soon', createdAt: justInside }, 'soon', now)).toBe(true);
-		expect(isOgImageUsable({ status: 'soon', createdAt: justOutside }, 'soon', now)).toBe(false);
-	});
-
-	it('refuses unparseable or far-future timestamps', () => {
-		expect(isOgImageUsable({ status: 'no', createdAt: 'yesterday-ish' }, 'no', now)).toBe(false);
-		expect(isOgImageUsable({ status: 'no', createdAt: '2026-11-07T12:00:00.000Z' }, 'no', now)).toBe(false);
+	it('ignores anything else', () => {
+		for (const v of [undefined, null, '', 'yes', 'yes-', 'maybe-1', 'YES-1', 'yes-1x', ' yes-1', 'yes-1-2', `yes-${'9'.repeat(17)}`]) {
+			expect(ogVersionStatus(v), String(v)).toBeNull();
+		}
 	});
 });
 
-describe('describeLaunchFailure', () => {
-	it('labels quota and rate-limit errors', () => {
-		expect(describeLaunchFailure(new Error('Unable to create new browser: code: 429: message: Too many browsers'))).toMatch(
-			/quota or rate limit/,
-		);
-		expect(describeLaunchFailure(new Error('Browser time limit exceeded for today'))).toMatch(/quota or rate limit/);
+function ogApp(state: Status, assets: (url: URL, init?: RequestInit) => Promise<Response>) {
+	const fetched: Array<{ path: string; headers: Headers }> = [];
+	// No DB binding at all: serving the card must not touch D1.
+	const env = {
+		ASSETS: {
+			fetch: async (url: URL, init?: RequestInit) => {
+				fetched.push({ path: url.pathname, headers: new Headers(init?.headers) });
+				return assets(url, init);
+			},
+		},
+	} as unknown as Env;
+	const app = new Hono<AppEnv>();
+	app.use('*', async (c, next) => {
+		c.set('state', { status: state, statusChangedAt: '2026-11-20T03:14:00.000Z', dueDate: null });
+		await next();
 	});
+	app.route('/', ledgerRoutes);
+	return { fetched, request: (path: string, init?: RequestInit) => app.request(path, init, env) };
+}
 
-	it('passes other failures through, truncated', () => {
-		const detail = describeLaunchFailure(new Error(`boom ${'x'.repeat(1000)}`));
-		expect(detail).toMatch(/^Could not launch a browser: boom/);
-		expect(detail.length).toBeLessThan(400);
-		expect(describeLaunchFailure('plain string')).toBe('Could not launch a browser: plain string');
+const png = async () =>
+	new Response(new Uint8Array(PNG_HEADER), {
+		headers: { 'Content-Type': 'image/png', ETag: '"card"', 'Cache-Control': 'public, max-age=0, must-revalidate' },
 	});
-});
 
 describe('GET /og.png', () => {
-	it('ignores the ?v= cache-buster the layout adds to og:image', async () => {
-		const fetched: string[] = [];
-		const env = {
-			DB: { prepare: () => ({ bind: () => ({ first: async () => null }) }) },
-			ASSETS: {
-				fetch: async (url: URL) => {
-					fetched.push(url.pathname);
-					return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), { headers: { 'Content-Type': 'image/png' } });
-				},
-			},
-		} as unknown as Env;
-		const app = new Hono<AppEnv>();
-		app.use('*', async (c, next) => {
-			c.set('state', { status: 'yes', statusChangedAt: '2026-11-20T03:14:00.000Z', dueDate: null });
-			await next();
-		});
-		app.route('/', ledgerRoutes);
-		const res = await app.request('/og.png?v=yes-1795144440000', {}, env);
+	it('serves the card a versioned og:image URL names, cached for good', async () => {
+		const { fetched, request } = ogApp('yes', png);
+		const res = await request('/og.png?v=yes-1795144440000');
 		expect(res.status).toBe(200);
 		expect(res.headers.get('content-type')).toBe('image/png');
+		expect(res.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
 		expect(res.headers.get('x-og-source')).toBe('static');
-		expect(fetched).toEqual(['/og/yes.png']);
+		expect(new Uint8Array(await res.arrayBuffer())).toEqual(new Uint8Array(PNG_HEADER));
+		expect(fetched.map((f) => f.path)).toEqual(['/og/yes.png']);
+	});
+
+	it('keeps a version pinned to its card even if this isolate has another status', async () => {
+		// The page was rendered by an isolate that already saw the flip; this one lags a moment.
+		const { fetched, request } = ogApp('no', png);
+		const res = await request('/og.png?v=yes-1795144440000');
+		expect(res.status).toBe(200);
+		expect(fetched.map((f) => f.path)).toEqual(['/og/yes.png']);
+	});
+
+	it('serves the current status for a bare or unrecognised URL, briefly cached', async () => {
+		for (const path of ['/og.png', '/og.png?v=maybe-1', '/og.png?v=<script>']) {
+			const { fetched, request } = ogApp('soon', png);
+			const res = await request(path);
+			expect(res.status, path).toBe(200);
+			expect(res.headers.get('cache-control'), path).toBe('public, max-age=300');
+			expect(fetched.map((f) => f.path), path).toEqual(['/og/soon.png']);
+		}
+	});
+
+	it('passes conditional headers through and keeps a 304', async () => {
+		const { fetched, request } = ogApp('no', async (_url, init) => {
+			const etag = new Headers(init?.headers).get('if-none-match');
+			return etag === '"card"' ? new Response(null, { status: 304, headers: { ETag: '"card"' } }) : png();
+		});
+		const res = await request('/og.png?v=no-0', { headers: { 'If-None-Match': '"card"', 'If-Modified-Since': 'Fri, 06 Nov 2026 22:03:00 GMT' } });
+		expect(res.status).toBe(304);
+		expect(res.headers.get('etag')).toBe('"card"');
+		expect(res.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
+		expect(fetched[0]?.headers.get('if-none-match')).toBe('"card"');
+		expect(fetched[0]?.headers.get('if-modified-since')).toBe('Fri, 06 Nov 2026 22:03:00 GMT');
+	});
+
+	it('says so, uncached, when the card is missing', async () => {
+		const { request } = ogApp('no', async () => new Response('Not found', { status: 404 }));
+		const res = await request('/og.png');
+		expect(res.status).toBe(404);
+		expect(res.headers.get('cache-control')).toBe('no-store');
 	});
 });

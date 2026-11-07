@@ -5,8 +5,13 @@
 #   * static assets from ./public (CSS, client JS, service worker, icons)
 #   * server routes (pages, feeds, API, MCP, admin) via Hono in src/index.ts
 #   * a Durable Object ("WaitingRoom") for live WebSockets / SSE
-#   * a Workflow ("AnnounceWorkflow") that fans notifications out with retries
-#   * a daily cron, a Resend inbound-email webhook, and Browser Rendering for OG images
+#   * three Workflows, so heavy work runs in steps that each get their own CPU budget:
+#     AnnounceWorkflow (status flips and updates: broadcast, ledger, DNS, notifications),
+#     InboundWorkflow (inbound email) and DailyWorkflow (the 09:00 UTC chores)
+#   * a daily cron that only starts DailyWorkflow
+#
+# Workers Free: every request, cron run and Workflow step gets 10 ms of CPU. See
+# "CPU budget (Workers Free)" in docs/ARCHITECTURE.md.
 #
 # Email is Resend (https://resend.com), both ways: notifications and auto-replies
 # go out via the API (RESEND_API_KEY), inbound *@iszacka.dad mail arrives as a
@@ -45,7 +50,7 @@ routes = [
 [observability]
 enabled = true
 
-# 09:00 UTC daily: "Day N: still no." post, daily digest, OG image refresh, cleanup.
+# 09:00 UTC daily: starts DailyWorkflow ("Day N: still no." post, DNS re-sync, cleanup).
 [triggers]
 crons = ["0 9 * * *"]
 
@@ -80,8 +85,18 @@ binding = "ANNOUNCE"
 name = "iszacka-dad-announce"
 class_name = "AnnounceWorkflow"
 
-[browser]
-binding = "BROWSER"
+# Inbound email: the Resend webhook only verifies, claims and hands off; each step
+# (fetch the email, decide, guess, reply, record) then gets its own 10 ms CPU budget.
+[[workflows]]
+binding = "INBOUND"
+name = "iszacka-dad-inbound"
+class_name = "InboundWorkflow"
+
+# The daily 09:00 UTC job: the cron only starts this; each chore is its own step.
+[[workflows]]
+binding = "DAILY"
+name = "iszacka-dad-daily"
+class_name = "DailyWorkflow"
 
 [version_metadata]
 binding = "CF_VERSION"
@@ -106,8 +121,7 @@ simple = { limit = 5, period = 60 }
 # Same code with a separate throwaway D1, no cron and Turnstile test keys. Previews
 # are public, so there is no admin password here: preview.yml stores the
 # PREVIEW_ADMIN_PASSWORD GitHub secret as the ADMIN_PASSWORD Worker secret (without
-# it, preview admin is off). No Browser Rendering either (it shares the account's
-# limits with production; /og.png falls back to the static cards), and the
+# it, preview admin is off). The Workflows have their own preview names, and the
 # rate limiters have their own namespaces so a preview can't use up production's.
 # CI deploys it with `--env preview --name <worker>-pr<N>`.
 [env.preview]
@@ -141,6 +155,16 @@ class_name = "WaitingRoom"
 binding = "ANNOUNCE"
 name = "iszacka-dad-announce-preview"
 class_name = "AnnounceWorkflow"
+
+[[env.preview.workflows]]
+binding = "INBOUND"
+name = "iszacka-dad-inbound-preview"
+class_name = "InboundWorkflow"
+
+[[env.preview.workflows]]
+binding = "DAILY"
+name = "iszacka-dad-daily-preview"
+class_name = "DailyWorkflow"
 
 [env.preview.version_metadata]
 binding = "CF_VERSION"

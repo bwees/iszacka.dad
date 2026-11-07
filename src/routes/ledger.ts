@@ -1,5 +1,7 @@
 // OWNER: ledger agent.
 // /ledger, /api/ledger, /.well-known/dad-ledger.json, /ledger/verify.mjs, /og.png.
+// Chain verification is memoised per isolate (see verifyLedgerCached): on Workers Free a
+// request gets 10 ms of CPU, and re-checking every hash and signature on every hit adds up.
 
 import type { Context } from 'hono';
 import { Hono } from 'hono';
@@ -20,7 +22,7 @@ import {
 	type LedgerVerification,
 	verifyLedger,
 } from '../lib/ledger';
-import { getStoredOgImage, isOgImageUsable, type StoredOgImage } from '../lib/og';
+import { ogCardPath, ogVersionStatus } from '../lib/og';
 import { allow, clientKey, sha256Hex, wantsJson } from '../lib/security';
 import { DAD, STATUS_COPY } from '../lib/site';
 import { formatLondon } from '../lib/time';
@@ -90,10 +92,51 @@ interface LedgerSnapshot {
 	verification: LedgerVerification;
 }
 
+// The last verification this isolate did. verifyLedger is pure, so the same entries and
+// key always give the same answer. The head hash and key are the quick check; the full
+// comparison means a past entry edited in D1 (same head, broken chain) is still caught.
+let verified: { headHash: string; publicKey: string; entries: readonly LedgerEntry[]; result: LedgerVerification } | null = null;
+
+function sameEntries(a: readonly LedgerEntry[], b: readonly LedgerEntry[]): boolean {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) {
+		const x = a[i] as LedgerEntry;
+		const y = b[i] as LedgerEntry;
+		if (
+			x.seq !== y.seq ||
+			x.at !== y.at ||
+			x.status !== y.status ||
+			x.note !== y.note ||
+			x.prevHash !== y.prevHash ||
+			x.hash !== y.hash ||
+			x.signature !== y.signature
+		) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/** verifyLedger, memoised per isolate by head hash plus public key (and the entries themselves). */
+export async function verifyLedgerCached(entries: readonly LedgerEntry[], publicKey: string): Promise<LedgerVerification> {
+	const headHash = entries.at(-1)?.hash ?? '';
+	if (verified && verified.headHash === headHash && verified.publicKey === publicKey && sameEntries(verified.entries, entries)) {
+		return { ...verified.result };
+	}
+	const result = await verifyLedger(entries, publicKey);
+	verified = { headHash, publicKey, entries, result };
+	return { ...result };
+}
+
+/** Forget the memoised verification (tests). */
+export function resetLedgerVerificationCache(): void {
+	verified = null;
+}
+
 async function loadSnapshot(env: Env): Promise<LedgerSnapshot> {
 	const entries = await getLedger(env, { limit: LEDGER_SNAPSHOT_LIMIT });
 	const publicKey = await getLedgerPublicKey(env);
-	const verification = await verifyLedger(entries, publicKey);
+	const verification = await verifyLedgerCached(entries, publicKey);
 	return { entries, publicKey, verification };
 }
 
@@ -361,49 +404,30 @@ ledgerRoutes.get('/.well-known/dad-ledger.json', async (c) => {
 
 // ── /og.png ─────────────────────────────────────────────────────────────────
 
-const OG_CACHE_CONTROL = 'public, max-age=300';
-
-function renderedOgResponse(c: Ctx, image: StoredOgImage, source: string): Response {
-	const created = Date.parse(image.createdAt);
-	const etag = `"og-${image.status}-${Number.isNaN(created) ? 0 : created}"`;
-	const headers: Record<string, string> = {
-		'Content-Type': 'image/png',
-		'Cache-Control': OG_CACHE_CONTROL,
-		ETag: etag,
-		'X-Og-Source': source,
-		'X-Og-Rendered-At': image.createdAt,
-	};
-	if (!Number.isNaN(created)) headers['Last-Modified'] = new Date(created).toUTCString();
-	if (c.req.header('if-none-match')?.includes(etag)) return new Response(null, { status: 304, headers });
-	return new Response(image.png, { status: 200, headers });
-}
+/**
+ * og:image URLs carry `?v=<status>-<ms>` (lib/layout.ts ogImageUrl), and a given
+ * version always gets the same pre-rendered card, so those can be cached for good.
+ * A bare /og.png follows the current status, so it only gets a few minutes.
+ */
+const OG_VERSIONED_CACHE_CONTROL = 'public, max-age=31536000, immutable';
+const OG_CURRENT_CACHE_CONTROL = 'public, max-age=300';
 
 ledgerRoutes.get('/og.png', async (c) => {
-	const status = c.get('state').status;
+	const versioned = ogVersionStatus(c.req.query('v'));
+	const status = versioned ?? c.get('state').status;
 
-	let stored: StoredOgImage | null = null;
-	try {
-		stored = await getStoredOgImage(c.env);
-	} catch (err) {
-		console.error('og.png: could not read the rendered image:', err);
-	}
-	if (stored && isOgImageUsable(stored, status)) return renderedOgResponse(c, stored, 'rendered');
-
-	// Fall back to the static card for this status, passing conditional headers through.
+	// Serve the pre-rendered card from assets, passing conditional headers through.
 	const conditional = new Headers();
 	for (const name of ['if-none-match', 'if-modified-since']) {
 		const value = c.req.header(name);
 		if (value) conditional.set(name, value);
 	}
-	const asset = await c.env.ASSETS.fetch(new URL(`/og/${status}.png`, c.req.url), { headers: conditional });
+	const asset = await c.env.ASSETS.fetch(new URL(ogCardPath(status), c.req.url), { headers: conditional });
 	if (asset.ok || asset.status === 304) {
 		const res = new Response(asset.body, asset);
-		res.headers.set('Cache-Control', OG_CACHE_CONTROL);
+		res.headers.set('Cache-Control', versioned ? OG_VERSIONED_CACHE_CONTROL : OG_CURRENT_CACHE_CONTROL);
 		res.headers.set('X-Og-Source', 'static');
 		return res;
 	}
-
-	// No static card either: a stale render of the right status beats nothing.
-	if (stored && stored.status === status) return renderedOgResponse(c, stored, 'rendered-stale');
 	return c.text('No preview image is available yet.', 404, { 'Cache-Control': 'no-store' });
 });

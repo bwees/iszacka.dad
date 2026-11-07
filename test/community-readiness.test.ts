@@ -1,7 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { DatabaseSync } from 'node:sqlite';
+import { describe, expect, it, vi } from 'vitest';
 import {
 	SUGGESTED_CHECKLIST,
 	dadcon,
+	getReadiness,
+	getReadinessSummary,
 	missingSuggestions,
 	readinessCommentary,
 	readinessPercent,
@@ -156,5 +159,38 @@ describe('suggested checklist', () => {
 
 	it('does not suggest duplicates within the suggestions themselves', () => {
 		expect(missingSuggestions([], ['A', 'a', 'B'])).toEqual(['A', 'B']);
+	});
+});
+
+describe('getReadinessSummary', () => {
+	/** The checklist table from the real schema, over node:sqlite, behind just enough D1. */
+	function checklistEnv(done: number[]) {
+		const db = new DatabaseSync(':memory:');
+		db.exec(`CREATE TABLE checklist (
+			id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0,
+			sort INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), done_at TEXT)`);
+		for (const [i, d] of done.entries()) db.prepare('INSERT INTO checklist (label, done, sort) VALUES (?, ?, ?)').run(`Item ${i}`, d, i);
+		const DB = {
+			prepare: (sql: string) => ({
+				first: async () => db.prepare(sql).get() ?? null,
+				all: async () => ({ results: db.prepare(sql).all() }),
+			}),
+		};
+		return { DB } as unknown as Env;
+	}
+
+	it('agrees with the full checklist, with one aggregate row', async () => {
+		for (const done of [[], [0], [1], [1, 0, 0], [1, 1, 0, 1, 0, 0, 0, 1], [1, 1, 1]]) {
+			const env = checklistEnv(done);
+			const { items: _items, ...full } = await getReadiness(env);
+			expect(await getReadinessSummary(env), JSON.stringify(done)).toEqual(full);
+		}
+	});
+
+	it('never throws: an unreadable checklist is an empty one', async () => {
+		vi.spyOn(console, 'error').mockImplementation(() => {});
+		const env = { DB: { prepare: () => ({ first: async () => Promise.reject(new Error('D1 down')) }) } } as unknown as Env;
+		expect(await getReadinessSummary(env)).toEqual({ done: 0, total: 0, percent: 0 });
+		vi.restoreAllMocks();
 	});
 });

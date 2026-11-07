@@ -1,15 +1,20 @@
-// Renders the static social-card fallbacks in public/og/{no,soon,yes}.png.
+// Renders the social preview cards in public/og/{no,soon,yes}.png. These are the
+// only OG images the site has: /og.png serves the one for the status straight from
+// static assets (routes/ledger.ts), with no rendering at request time, because a
+// Workers Free invocation gets 10 ms of CPU and a headless browser needs far more.
 //
 //   node scripts/og-render.ts [outDir] [--screenshot]
 //
-// Writes one self-contained HTML card per status (the exact markup the live
-// /og/card route and Browser Rendering use, via renderOgCardHtml) into outDir
-// (default node_modules/.cache/og-render). With --screenshot it then captures
-// each at 1200×630 into public/og/ using the agent-browser CLI; without it, open
-// the HTML files in any browser at that size and screenshot them yourself.
+// Writes one self-contained HTML card per status (renderOgCardHtml in
+// src/lib/og-card.ts, the same markup as the /og/card preview route) into outDir
+// (default node_modules/.cache/og-render). With --screenshot it then captures each
+// at 1200×630 into public/og/ using the agent-browser CLI; without it, open the HTML
+// files in any browser at that size and screenshot them yourself.
 //
-// The fallbacks are generic on purpose (no due date, no check count), because
-// they are only served when the live image hasn't been rendered yet.
+// Re-run it with --screenshot and commit the PNGs whenever the card design or copy
+// changes (lib/og-card.ts, STATUS_COPY in lib/site.ts). The next deploy ships them.
+// The cards are generic on purpose (no due date, no check count) because one image
+// is served for as long as a status lasts.
 
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';

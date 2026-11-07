@@ -16,8 +16,18 @@
 // `curl -N` against a PR preview can't use up the account's allowance.
 //
 // One alarm does several jobs: it coalesces viewer-count broadcasts (~1s), flushes vibe
-// counts to SQLite (one upsert per emoji, not one per vibe), and sends SSE heartbeats
-// (~15s) while streams exist.
+// counts to SQLite (one upsert per emoji, not one per vibe), writes waiting checks to D1, and
+// sends SSE heartbeats (~15s) while streams exist.
+//
+// Checks: every counted request sends one tiny `recordCheck` RPC here (src/lib/counters.ts),
+// so the Worker does no D1 work for it. Checks are tallied in memory and written to D1's
+// checks_* tables in one batch (one upsert per distinct key) at most every CHECK_FLUSH_MS; the
+// same batch reads back D1's total, which plus whatever is still waiting is the running total
+// that `checks` broadcasts, hellos and the `checkTotal` RPC report, with no SUM per call. The
+// first check after a wake is written straight away, which is also how the total is learned.
+// Hibernation forgets memory after ~10 s of quiet, so while checks wait the alarm looks in
+// every CHECK_TICK_MS, and writes them as soon as traffic goes quiet. A restart (deploy) can
+// still lose the few seconds' worth that were waiting; that's fine for a vanity counter.
 //
 // Storage: SQLite-backed. `vibes` holds all-time counts per emoji; the sync KV holds the
 // opening date and the salt for client tags. The last broadcast viewer count is kept in
@@ -25,12 +35,24 @@
 // clients that reconnected mid-count are corrected.
 
 import { DurableObject } from 'cloudflare:workers';
-import { getCheckTotal } from '../lib/counters';
+import {
+	CHECK_TOTAL_SQL,
+	type CheckEvent,
+	checkUpserts,
+	emptyCheckTallies,
+	mergeCheckTallies,
+	parseCheckEvent,
+	tallyCheck,
+} from '../lib/counters';
 import { randomToken, rateLimitSubject, sha256Hex } from '../lib/security';
 import { getSetting, getState } from '../lib/state';
 import { nowIso } from '../lib/time';
 import type { LiveMessage, SiteState } from '../types';
 import {
+	CHECK_RETRY_MS,
+	CHECK_TICK_MS,
+	CHECKS_BROADCAST_MS,
+	checksDue,
 	frameBudget,
 	heartbeatText,
 	mergeVibeCounts,
@@ -123,7 +145,6 @@ export class WaitingRoom extends DurableObject<Env> {
 	/** Last state known from any source; the fallback if D1 is unavailable. */
 	#knownState: SiteState | null = null;
 	#reloadNonce: { value: string; at: number } | null = null;
-	#lastChecks = 0;
 	/** Bumped by every state / reload broadcast, so a hello can tell it raced one. */
 	#stateSeq = 0;
 	#nonceSeq = 0;
@@ -131,6 +152,26 @@ export class WaitingRoom extends DurableObject<Env> {
 	#lastViewers: number | null = null;
 	/** Vibes counted but not yet written to SQLite (flushed by the alarm). */
 	readonly #pendingVibes = new Map<string, { n: number; lastAt: string }>();
+	/** Checks counted but not yet written to D1, and when the oldest and newest of them arrived. */
+	#pendingChecks = emptyCheckTallies();
+	#firstCheckAt = 0;
+	#lastCheckAt = 0;
+	/** Checks in the D1 batch being written right now. */
+	#writingChecks = 0;
+	/** D1's total as of the last write; null until known since this object woke. */
+	#storedChecks: number | null = null;
+	/** The D1 write in progress, so there is only ever one. */
+	#checksWrite: Promise<void> | null = null;
+	/** No D1 write before this (set after one fails). */
+	#checksRetryAt = 0;
+	/** The total last sent out (or that would have been, had anyone been listening), and when. */
+	#sentChecks = { value: -1, at: 0 };
+	/** A newer total is waiting for the alarm (one went out under CHECKS_BROADCAST_MS ago). */
+	#checksDirty = false;
+	/** Open WebSockets; null when it needs recounting (after a wake, or a socket went away). */
+	#sockets: number | null = null;
+	/** When the alarm is set for: undefined until read from storage, null for none. */
+	#alarmAt: number | null | undefined = undefined;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -171,11 +212,34 @@ export class WaitingRoom extends DurableObject<Env> {
 	}
 
 	/**
-	 * RPC for /api/live (polling clients): the live numbers plus the reload nonce, so a tab that
-	 * can't hold a WebSocket still obeys "reload every browser". The nonce is cached for 30s.
+	 * RPC for /api/live (polling clients): the live numbers and check total, plus the reload
+	 * nonce, so a tab that can't hold a WebSocket still obeys "reload every browser". The nonce
+	 * is cached for 30s.
 	 */
-	async liveSnapshot(): Promise<{ viewers: number; vibes: number; reloadNonce: string }> {
-		return { viewers: this.#viewerCount(), vibes: this.#vibeTotal, reloadNonce: await this.#currentReloadNonce() };
+	async liveSnapshot(): Promise<{ viewers: number; vibes: number; checks: number; reloadNonce: string }> {
+		const [checks, reloadNonce] = await Promise.all([this.#checkTotal(), this.#currentReloadNonce()]);
+		return { viewers: this.#viewerCount(), vibes: this.#vibeTotal, checks, reloadNonce };
+	}
+
+	/**
+	 * RPC from recordCheck (src/lib/counters.ts): count one check. Usually memory only; the
+	 * first check after a wake is written to D1 straight away, which also learns the total.
+	 */
+	async recordCheck(input: CheckEvent): Promise<void> {
+		const check = parseCheckEvent(input);
+		if (!check) return;
+		const now = Date.now();
+		if (this.#pendingChecks.total === 0) this.#firstCheckAt = now;
+		tallyCheck(this.#pendingChecks, check);
+		this.#lastCheckAt = now;
+		if (this.#storedChecks === null && now >= this.#checksRetryAt) await this.#syncChecks();
+		this.#checksChanged(Date.now());
+		if (this.#pendingChecks.total > 0) await this.#ensureAlarmSafely(now + CHECK_TICK_MS);
+	}
+
+	/** RPC: total checks ever, including the ones not yet written to D1. */
+	async checkTotal(): Promise<number> {
+		return this.#checkTotal();
 	}
 
 	/** RPC: live numbers plus the vibe breakdown, for /stats. */
@@ -221,6 +285,7 @@ export class WaitingRoom extends DurableObject<Env> {
 		} catch {
 			// Already closing.
 		}
+		this.#sockets = null;
 		this.ctx.waitUntil(this.#viewersChanged());
 	}
 
@@ -230,6 +295,7 @@ export class WaitingRoom extends DurableObject<Env> {
 		} catch {
 			// Already closed (the runtime may have replied to the close frame itself).
 		}
+		this.#sockets = null;
 		await this.#viewersChanged();
 	}
 
@@ -240,10 +306,14 @@ export class WaitingRoom extends DurableObject<Env> {
 		} catch {
 			// Already gone.
 		}
+		this.#sockets = null;
 		await this.#viewersChanged();
 	}
 
 	override async alarm(): Promise<void> {
+		// This alarm is no longer pending; and recount sockets now and then, in case one went quietly.
+		this.#alarmAt = null;
+		this.#sockets = null;
 		try {
 			this.#flushVibes();
 			this.#expireStreams();
@@ -252,6 +322,7 @@ export class WaitingRoom extends DurableObject<Env> {
 				this.#lastViewers = viewers;
 				this.#fanOut({ type: 'viewers', viewers });
 			}
+			await this.#checksAlarm();
 			if (this.#streams.size > 0) {
 				this.#heartbeat();
 				await this.#ensureAlarm(Date.now() + HEARTBEAT_MS);
@@ -273,6 +344,7 @@ export class WaitingRoom extends DurableObject<Env> {
 
 		const { 0: client, 1: server } = new WebSocketPair();
 		this.ctx.acceptWebSocket(server, tag ? [tag] : []);
+		if (this.#sockets !== null) this.#sockets += 1;
 		const now = Date.now();
 		server.serializeAttachment({ connectedAt: now, vibes: [], frameWindowStart: now, frames: 0 } satisfies SocketAttachment);
 		this.#send(server, JSON.stringify({ ...hello, viewers: this.#viewerCount() } satisfies HelloMessage));
@@ -353,12 +425,20 @@ export class WaitingRoom extends DurableObject<Env> {
 		}
 	}
 
-	#socketCount(exclude?: WebSocket): number {
-		let count = 0;
-		for (const ws of this.ctx.getWebSockets()) {
-			if (ws !== exclude && ws.readyState !== WS_CLOSING && ws.readyState !== WS_CLOSED) count++;
+	/**
+	 * Open WebSockets. Kept as a running count (accepting adds one) and only recounted from
+	 * getWebSockets() after a socket goes away or the object wakes, not on every call: at the
+	 * big moment there may be thousands of sockets and a page view asks for this every time.
+	 */
+	#socketCount(): number {
+		if (this.#sockets === null) {
+			let count = 0;
+			for (const ws of this.ctx.getWebSockets()) {
+				if (ws.readyState !== WS_CLOSING && ws.readyState !== WS_CLOSED) count++;
+			}
+			this.#sockets = count;
 		}
-		return count;
+		return this.#sockets;
 	}
 
 	// ── Server-Sent Events ────────────────────────────────────────────────────
@@ -461,9 +541,6 @@ export class WaitingRoom extends DurableObject<Env> {
 				this.#reloadNonce = { value: msg.nonce, at };
 				this.#nonceSeq++;
 				break;
-			case 'checks':
-				this.#lastChecks = Math.max(this.#lastChecks, msg.checks);
-				break;
 			default:
 				break;
 		}
@@ -478,11 +555,7 @@ export class WaitingRoom extends DurableObject<Env> {
 	async #hello(): Promise<HelloMessage | null> {
 		const stateBefore = this.#stateSeq;
 		const nonceBefore = this.#nonceSeq;
-		const [read, checks, readNonce] = await Promise.all([
-			this.#currentState(),
-			getCheckTotal(this.env),
-			this.#currentReloadNonce(),
-		]);
+		const [read, checks, readNonce] = await Promise.all([this.#currentState(), this.#checkTotal(), this.#currentReloadNonce()]);
 		const state = preferBroadcast(read, this.#broadcastState?.state, stateBefore, this.#stateSeq);
 		const reloadNonce = preferBroadcast(readNonce, this.#reloadNonce?.value, nonceBefore, this.#nonceSeq);
 		if (!state) return null;
@@ -491,7 +564,7 @@ export class WaitingRoom extends DurableObject<Env> {
 			state,
 			viewers: this.#viewerCount(),
 			vibes: this.#vibeTotal,
-			checks: Math.max(checks, this.#lastChecks),
+			checks,
 			reloadNonce,
 		};
 	}
@@ -527,10 +600,101 @@ export class WaitingRoom extends DurableObject<Env> {
 		}
 	}
 
+	// ── Checks ────────────────────────────────────────────────────────────────
+
+	/** Total checks ever: D1's total plus whatever is being written or still waiting. */
+	async #checkTotal(): Promise<number> {
+		if (this.#storedChecks === null && Date.now() >= this.#checksRetryAt) await this.#syncChecks();
+		return this.#knownChecks();
+	}
+
+	#knownChecks(): number {
+		// Without D1's total (D1 has been down since this object woke), all we know is what's waiting.
+		return (this.#storedChecks ?? 0) + this.#writingChecks + this.#pendingChecks.total;
+	}
+
+	/** Write the waiting checks to D1 and read back the total, in one batch. One at a time. */
+	#syncChecks(): Promise<void> {
+		this.#checksWrite ??= this.#writeChecks().finally(() => {
+			this.#checksWrite = null;
+		});
+		return this.#checksWrite;
+	}
+
+	/** Never throws: if the batch fails, its checks go back in the queue for the next try. */
+	async #writeChecks(): Promise<void> {
+		const batch = this.#pendingChecks;
+		const firstAt = this.#firstCheckAt;
+		this.#pendingChecks = emptyCheckTallies();
+		this.#writingChecks = batch.total;
+		const { DB } = this.env;
+		try {
+			const results = await DB.batch<{ total: number }>([
+				...checkUpserts(batch).map(({ sql, args }) => DB.prepare(sql).bind(...args)),
+				DB.prepare(CHECK_TOTAL_SQL),
+			]);
+			// Same transaction as the upserts, so this includes them (and anyone else's writes).
+			this.#storedChecks = Number(results.at(-1)?.results[0]?.total) || 0;
+			this.#checksRetryAt = 0;
+		} catch (err) {
+			console.error('waiting room: could not store checks; keeping them for the next try', err);
+			mergeCheckTallies(this.#pendingChecks, batch);
+			// Anything that arrived during the write is newer than the batch.
+			if (batch.total > 0) this.#firstCheckAt = firstAt;
+			this.#checksRetryAt = Date.now() + CHECK_RETRY_MS;
+		} finally {
+			this.#writingChecks = 0;
+		}
+	}
+
+	/** Send the new total: now, or from the alarm if one went out under CHECKS_BROADCAST_MS ago. */
+	#checksChanged(now: number): void {
+		if (this.#storedChecks === null) return; // unknown until D1 answers
+		const checks = this.#knownChecks();
+		if (checks === this.#sentChecks.value) return;
+		if (this.#viewerCount() === 0) {
+			// Nobody to tell (a new client's hello carries the total), so no alarm for it either.
+			this.#sentChecks = { value: checks, at: this.#sentChecks.at };
+			return;
+		}
+		if (now - this.#sentChecks.at >= CHECKS_BROADCAST_MS) {
+			this.#sendChecks(now);
+			return;
+		}
+		if (this.#checksDirty) return;
+		this.#checksDirty = true;
+		this.ctx.waitUntil(this.#ensureAlarmSafely(this.#sentChecks.at + CHECKS_BROADCAST_MS));
+	}
+
+	#sendChecks(now: number): void {
+		this.#checksDirty = false;
+		const checks = this.#knownChecks();
+		if (checks === this.#sentChecks.value) return;
+		this.#sentChecks = { value: checks, at: now };
+		// Nobody listening: nothing to send (a new client's hello carries the total).
+		if (this.#viewerCount() > 0) this.#fanOut({ type: 'checks', checks });
+	}
+
+	/** The alarm's part: write waiting checks when they're due, send a held-back total, keep ticking. */
+	async #checksAlarm(): Promise<void> {
+		const now = Date.now();
+		if (this.#pendingChecks.total > 0 && now >= this.#checksRetryAt && checksDue(now, this.#firstCheckAt, this.#lastCheckAt)) {
+			await this.#syncChecks();
+		}
+		if (this.#checksDirty || this.#storedChecks !== null) this.#sendChecks(Date.now());
+		if (this.#pendingChecks.total > 0) await this.#ensureAlarm(Date.now() + CHECK_TICK_MS);
+	}
+
+	// ── Alarm ─────────────────────────────────────────────────────────────────
+
 	/** Schedule a (coalesced) viewer-count broadcast. */
 	async #viewersChanged(): Promise<void> {
+		await this.#ensureAlarmSafely(Date.now() + VIEWER_DEBOUNCE_MS);
+	}
+
+	async #ensureAlarmSafely(at: number): Promise<void> {
 		try {
-			await this.#ensureAlarm(Date.now() + VIEWER_DEBOUNCE_MS);
+			await this.#ensureAlarm(at);
 		} catch (err) {
 			console.error('waiting room: could not schedule alarm', err);
 		}
@@ -538,9 +702,23 @@ export class WaitingRoom extends DurableObject<Env> {
 
 	/** Make sure an alarm fires no later than `at` (never postpones an earlier one). */
 	async #ensureAlarm(at: number): Promise<void> {
-		const current = await this.ctx.storage.getAlarm();
+		// Remembered, so the common case (an alarm is already due soon enough) costs no storage call.
+		if (this.#alarmAt === undefined) {
+			const stored = await this.ctx.storage.getAlarm();
+			// Another call may have set one while this read was in flight: that one is newer.
+			if (this.#alarmAt === undefined) this.#alarmAt = stored;
+		}
+		const current = this.#alarmAt;
 		// A past value means that alarm is the one running right now, so it doesn't count.
-		if (current === null || current <= Date.now() || current > at) await this.ctx.storage.setAlarm(at);
+		if (current !== null && current > Date.now() && current <= at) return;
+		this.#alarmAt = at;
+		try {
+			await this.ctx.storage.setAlarm(at);
+		} catch (err) {
+			// Don't trust the remembered time if storage never got it: read it again next time.
+			this.#alarmAt = undefined;
+			throw err;
+		}
 	}
 }
 

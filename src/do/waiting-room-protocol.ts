@@ -204,3 +204,28 @@ export function preferBroadcast<T>(read: T, pushed: T | undefined, before: numbe
 export function streamExpired(openedAt: number, now: number, maxMs: number | null): boolean {
 	return maxMs !== null && now - openedAt >= maxMs;
 }
+
+// ── Check counting (pure) ────────────────────────────────────────────────────
+
+/** Checks wait in memory at most about this long before one D1 batch writes them. */
+export const CHECK_FLUSH_MS = 30_000;
+/**
+ * While checks wait, the alarm looks in at least this often. An object with nothing to do for
+ * ~10 s may hibernate, and hibernating forgets everything in memory, so the wait never gets
+ * that quiet.
+ */
+export const CHECK_TICK_MS = 5_000;
+/** No new check for this long: traffic has gone quiet, so write now rather than keep ticking. */
+export const CHECK_QUIET_MS = 4_000;
+/** After a failed D1 write, wait this long before trying again. */
+export const CHECK_RETRY_MS = 30_000;
+/** The live `checks` count goes out at most once per this interval. */
+export const CHECKS_BROADCAST_MS = 1_000;
+
+/**
+ * Whether waiting checks should be written to D1 now: the oldest has waited long enough, or
+ * none has arrived for a while (writing now is cheaper than ticking until the deadline).
+ */
+export function checksDue(now: number, firstAt: number, lastAt: number): boolean {
+	return now - firstAt >= CHECK_FLUSH_MS || now - lastAt >= CHECK_QUIET_MS;
+}

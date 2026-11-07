@@ -24,6 +24,12 @@ module ownership, foundation APIs, the URL map, the live protocol and the UI kit
   length-limited and trimmed.
 - **Delivery functions never throw**; they return `DeliveryResult`.
 - **Time**: Europe/London for "days" (`src/lib/time.ts`); store ISO UTC.
+- **10 ms of CPU** (Workers Free): every request (`waitUntil` included), cron run and Workflow
+  step must fit. Heavy or slow work goes into a Workflow step (`ANNOUNCE`, `INBOUND`, `DAILY`);
+  no headless browser (the OG cards are pre-rendered by `scripts/og-render.ts`); nothing costly
+  at module scope; no `Intl`, `toLocale*` or `localeCompare` on hot paths (use `lib/time.ts`'s
+  `formatLondon`, `formatNumber` and friends, or its memoised `dateTimeFormat`). See "CPU budget
+  (Workers Free)" in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **British English**, dry and witty: nappy, colour, favourite.
 
 ## Checks

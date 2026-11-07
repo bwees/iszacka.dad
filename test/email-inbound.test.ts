@@ -1,42 +1,62 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { sqliteD1 } from './email-inbound-helpers';
 
-// Other agents' modules are mocked so these tests only exercise the email agent's logic.
+// Other agents' modules are mocked so these tests only exercise the inbound logic.
 const mocks = vi.hoisted(() => ({
 	parseGuessText: vi.fn(),
-	submitGuess: vi.fn(),
 	allow: vi.fn(async () => true),
 	hashIdentifier: vi.fn(async (_env: unknown, value: string) => `hash:${value}`),
-	getState: vi.fn(async () => ({ status: 'no', statusChangedAt: '2026-10-01T10:00:00.000Z', dueDate: '2026-11-20' })),
-	liveStats: vi.fn(async () => ({ viewers: 2, vibes: 0 })),
-	getCheckTotal: vi.fn(async () => 999),
 }));
-vi.mock('../src/lib/pool', () => ({ parseGuessText: mocks.parseGuessText, submitGuess: mocks.submitGuess }));
+vi.mock('../src/lib/pool', () => ({ parseGuessText: mocks.parseGuessText, submitGuess: vi.fn() }));
 vi.mock('../src/lib/security', async (importOriginal) => ({
 	...(await importOriginal<typeof import('../src/lib/security')>()),
 	allow: mocks.allow,
 	hashIdentifier: mocks.hashIdentifier,
 }));
-vi.mock('../src/lib/state', () => ({ getState: mocks.getState }));
-vi.mock('../src/lib/live', () => ({ liveStats: mocks.liveStats }));
-vi.mock('../src/lib/counters', () => ({ getCheckTotal: mocks.getCheckTotal }));
+vi.mock('../src/lib/state', () => ({ getState: vi.fn(), getOrCreateSetting: vi.fn() }));
+vi.mock('../src/lib/live', () => ({ liveStats: vi.fn() }));
+vi.mock('../src/lib/counters', () => ({ getCheckTotal: vi.fn() }));
 
 const {
-	ANONYMOUS_NAME,
+	MAX_GUESS_TEXT,
+	MAX_HTML_CHARS,
+	MAX_RECEIVED_BYTES,
+	MAX_TEXT_CHARS,
+	TransientFetchError,
 	automatedReason,
 	bareAddress,
 	cleanName,
+	decideInbound,
 	extractFreshText,
-	handleInboundEmail,
+	fetchReceivedEmail,
+	guessText,
 	htmlToText,
+	keptHeaders,
 	normaliseMessageId,
 	ownDomains,
+	readCapped,
+	recordInbound,
+	senderAuthenticated,
+	sliceChars,
 	threadingHeaders,
+	trimReceivedEmail,
 } = await import('../src/email-handler');
-type InboundEmail = import('../src/email-handler').InboundEmail;
+type FetchedEmail = import('../src/email-handler').FetchedEmail;
 
 const OWN = ['iszacka.dad'];
 const headers = (init: Record<string, string> = {}) => new Headers(init);
 const reason = (from: string, h: Record<string, string> = {}) => automatedReason({ from, headers: headers(h), ownDomains: OWN });
+
+/** Best of `runs` timings, in ms (the first run warms the JIT). */
+function fastest(fn: () => unknown, runs = 3): number {
+	let best = Number.POSITIVE_INFINITY;
+	for (let i = 0; i < runs; i++) {
+		const start = performance.now();
+		fn();
+		best = Math.min(best, performance.now() - start);
+	}
+	return best;
+}
 
 describe('loop protection', () => {
 	it('lets a normal human through', () => {
@@ -72,6 +92,7 @@ describe('loop protection', () => {
 		'list-bounces@example.com',
 		'stork@iszacka.dad',
 		'anything@mail.iszacka.dad',
+		`${'a'.repeat(400)}@example.com`,
 	])('ignores sender %j', (from) => {
 		expect(reason(from)).not.toBeNull();
 	});
@@ -88,6 +109,13 @@ describe('loop protection', () => {
 			'other.example',
 		]);
 	});
+
+	it("only trusts Resend's structured verdicts", () => {
+		expect(senderAuthenticated({ spf: 'pass', dkim: 'pass', dmarc: 'gray' })).toBe(true);
+		expect(senderAuthenticated({ dkim: 'fail', dmarc: 'pass' })).toBe(true);
+		expect(senderAuthenticated({ spf: 'pass', dkim: 'fail', dmarc: 'fail' })).toBe(false);
+		expect(senderAuthenticated(null)).toBe(false);
+	});
 });
 
 describe('parsing helpers', () => {
@@ -96,11 +124,68 @@ describe('parsing helpers', () => {
 		expect(extractFreshText(text)).toBe('14 Nov 15:30\nName: Alex');
 		expect(extractFreshText('hello\n> quoted 1 Jan\nbye\n-- \nsig 2 Feb')).toBe('hello\nbye');
 		expect(extractFreshText('guess 3pm\n-----Original Message-----\nFrom: x')).toBe('guess 3pm');
+		// A From: line only ends the fresh part once there is some.
+		expect(extractFreshText('\n\nFrom: me\n14 Nov\nFrom: them\nold')).toBe('From: me\n14 Nov');
 	});
 
 	it('turns HTML-only emails into text', () => {
 		expect(htmlToText('<p>14 Nov&nbsp;15:30</p><div>Name: A &amp; B</div><style>p{}</style>')).toContain('14 Nov 15:30');
 		expect(htmlToText('<p>Name: A &amp; B</p>')).toContain('Name: A & B');
+		expect(htmlToText('a<br>b<br/>c</p >d')).toBe('a\nb\nc\nd');
+	});
+
+	it('drops closed script, style and head blocks, and nothing else', () => {
+		expect(htmlToText('<head><title>x 1 Jan</title></head><body>14 Nov</body>').trim()).toBe('14 Nov');
+		expect(htmlToText('a<script type="x">1 Jan</script>b<STYLE>2 Feb</Style >c').replace(/\s+/g, '')).toBe('abc');
+		// <header> is not <head>, and </header> doesn't close a <head>.
+		expect(htmlToText('<header>14 Nov</header>')).toContain('14 Nov');
+		expect(htmlToText('<head><header>14 Nov</header>').trim()).toBe('14 Nov');
+		// An unclosed block keeps its content (only the tag goes), like the old regex.
+		expect(htmlToText('<style>14 Nov 15:30').trim()).toBe('14 Nov 15:30');
+		// Several blocks, one unclosed name among closed ones.
+		expect(htmlToText('<style>a</style>x<script>y<style>b</style>z').replace(/\s+/g, '')).toBe('xyz');
+	});
+
+	it('reads at most MAX_HTML_CHARS of HTML', () => {
+		const html = `<p>${'a'.repeat(MAX_HTML_CHARS)}</p><p>14 Nov</p>`;
+		expect(htmlToText(html)).not.toContain('14 Nov');
+		expect(sliceChars('ab\u{1F600}', 3)).toBe('ab');
+	});
+
+	describe('stays linear on hostile input', () => {
+		const cases: Array<[string, string]> = [
+			['140 KB of unclosed <style>', '<style>'.repeat(20_000)],
+			['72 KB of <header> with no </head>', '<header>x'.repeat(8_000)],
+			['140 KB of unclosed <script and <head', '<script <head '.repeat(10_000)],
+			['140 KB of "<"', '<'.repeat(140_000)],
+			['140 KB of <br followed by spaces', `<br${' '.repeat(140_000)}`],
+			['140 KB of blank lines', '\n \n'.repeat(46_000)],
+		];
+
+		it.each(cases)('htmlToText: %s parses in under 5 ms', (_label, html) => {
+			expect(fastest(() => htmlToText(html))).toBeLessThan(5);
+		});
+
+		it.each(cases)('htmlToText without the slice: %s stays under 25 ms', (_label, html) => {
+			// The old code took 178 ms on the unclosed <style> and 175 ms on 32 KB of "<".
+			expect(fastest(() => htmlToText(html, Number.POSITIVE_INFINITY))).toBeLessThan(25);
+		});
+
+		it('guessText on 140 KB of hostile text and HTML stays under 5 ms', () => {
+			const lines = '\n'.repeat(70_000) + 'From: x\n'.repeat(10_000);
+			expect(fastest(() => guessText('guess', lines, null))).toBeLessThan(5);
+			expect(fastest(() => guessText('guess', null, '<style>'.repeat(20_000)))).toBeLessThan(5);
+		});
+	});
+
+	it('hands the guess parser the subject and the fresh text, sliced', () => {
+		expect(guessText('My guess', '14 Nov 15:30\n> 1 Dec', null)).toBe('My guess\n14 Nov 15:30');
+		expect(guessText('guess', null, '<p>14 Nov</p><style>1 Dec</style>')).toBe('guess\n14 Nov');
+		// Text wins over HTML, even when empty.
+		expect(guessText('guess', '', '<p>14 Nov</p>')).toBe('guess\n');
+		expect(guessText('guess', 'x'.repeat(100_000), null)).toHaveLength(MAX_GUESS_TEXT);
+		// Only the first MAX_TEXT_CHARS are read at all.
+		expect(guessText('guess', `${' '.repeat(MAX_TEXT_CHARS)}14 Nov`, null)).toBe('guess\n');
 	});
 
 	it('cleans display names', () => {
@@ -121,6 +206,7 @@ describe('parsing helpers', () => {
 		expect(bareAddress(null)).toBe('');
 		expect(bareAddress('two words@example.com')).toBe('');
 		expect(bareAddress('a@example.com, b@example.com')).toBe('');
+		expect(bareAddress(`${'a'.repeat(400)}@example.com`)).toBe('');
 	});
 
 	it('normalises Message-IDs and builds threading headers', () => {
@@ -132,221 +218,270 @@ describe('parsing helpers', () => {
 	});
 });
 
-// ─── The handler, end to end (with a fake runtime and a fake Resend API) ────
+// ─── Step 1: fetch ───────────────────────────────────────────────────────────
 
-interface Sent {
-	to: string;
-	from: string;
-	subject: string;
-	text: string;
-	html: string;
-	headers?: Record<string, string>;
-}
+const received = (over: Record<string, unknown> = {}) => ({
+	object: 'email',
+	id: 'e-123',
+	from: 'Alex Example <Alex@Example.com>',
+	to: ['ask@iszacka.dad'],
+	subject: 'My guess',
+	text: '14 Nov 15:30\nName: Sam',
+	html: '<p>14 Nov 15:30</p>',
+	headers: {
+		From: 'Alex Example <Alex@Example.com>',
+		'Message-ID': '<orig-123@example.com>',
+		References: ['<a@example.com>', '<b@example.com>'],
+		'Authentication-Results': 'mx.example.com; dkim=pass; dmarc=pass',
+		Received: 'from somewhere',
+		'Auto-Submitted': 'no',
+	},
+	message_id: '<orig-123@example.com>',
+	authentication: { spf: 'pass', dkim: 'pass', dmarc: 'gray', extra: 'ignored' },
+	attachments: [],
+	...over,
+});
 
-function fakeEnv(sentToday = 0) {
-	const sent: Sent[] = [];
-	const inbound: unknown[][] = [];
-	const db = {
-		prepare(sql: string) {
-			return {
-				bind(...args: unknown[]) {
-					return {
-						async run() {
-							if (sql.startsWith('INSERT INTO inbound_emails')) inbound.push(args);
-							return { meta: { changes: 1 } };
-						},
-						async first() {
-							return { n: sql.includes('email_sends') ? sentToday : 0 };
-						},
-					};
-				},
-			};
-		},
-	};
-	const fetch = vi.fn(async (url: string, init: RequestInit) => {
-		expect(url).toBe('https://resend.test/emails');
-		expect(new Headers(init.headers).get('authorization')).toBe('Bearer re_test_key');
-		sent.push(JSON.parse(String(init.body)) as Sent);
-		return Response.json({ id: 'reply-1' });
+describe('trimReceivedEmail', () => {
+	it('keeps only what the later steps read', () => {
+		expect(trimReceivedEmail(received(), 'alex@example.com')).toEqual({
+			from: 'alex@example.com',
+			subject: 'My guess',
+			text: '14 Nov 15:30\nName: Sam',
+			html: null,
+			headers: { 'message-id': '<orig-123@example.com>', references: '<a@example.com> <b@example.com>', 'auto-submitted': 'no' },
+			messageId: '<orig-123@example.com>',
+			references: '<a@example.com> <b@example.com>',
+			authentication: { spf: 'pass', dkim: 'pass', dmarc: 'gray' },
+		});
 	});
-	vi.stubGlobal('fetch', fetch);
+
+	it("prefers the webhook's sender, else reduces the email's From to the bare address", () => {
+		expect(trimReceivedEmail(received(), 'sender@example.org').from).toBe('sender@example.org');
+		expect(trimReceivedEmail(received(), '').from).toBe('alex@example.com');
+	});
+
+	it('drops the body unless it is a guess, and keeps HTML only without a text part', () => {
+		expect(trimReceivedEmail(received({ subject: 'Well?' }))).toMatchObject({ text: null, html: null });
+		const html = trimReceivedEmail(received({ text: null, html: `<p>14 Nov</p>${'x'.repeat(100_000)}` }));
+		expect(html.text).toBeNull();
+		expect(html.html).toHaveLength(MAX_HTML_CHARS);
+		expect(trimReceivedEmail(received({ text: 'y'.repeat(100_000) })).text).toHaveLength(MAX_TEXT_CHARS);
+	});
+
+	it('never carries forged authentication headers, and survives junk', () => {
+		const forged = trimReceivedEmail(received({ authentication: undefined }));
+		expect(forged.authentication).toBeNull();
+		expect(JSON.stringify(forged)).not.toContain('dkim=pass');
+		const junk = trimReceivedEmail({ id: 'x', subject: 7, headers: 'nope', authentication: 'pass' } as never);
+		expect(junk).toMatchObject({ from: '', subject: '', headers: {}, authentication: null, messageId: null });
+	});
+
+	it('caps header values, keeping the newest References', () => {
+		const refs = Array.from({ length: 200 }, (_, i) => `<ref-${i}@example.com>`).join(' ');
+		const kept = keptHeaders({ references: refs, 'list-id': '', precedence: 'p'.repeat(5000), 'x-other': 'x' });
+		expect(kept.references?.endsWith('<ref-199@example.com>')).toBe(true);
+		expect(kept.references?.length).toBeLessThanOrEqual(2000);
+		expect(kept.precedence).toHaveLength(2000);
+		expect(kept['list-id']).toBe('');
+		expect(kept).not.toHaveProperty('x-other');
+	});
+});
+
+describe('readCapped', () => {
+	it('reads a body under the cap', async () => {
+		expect(await readCapped(new Response('hello'), 10)).toBe('hello');
+	});
+
+	it('refuses a declared or streamed body over the cap', async () => {
+		expect(await readCapped(new Response('x'.repeat(20), { headers: { 'content-length': '20' } }), 10)).toBeNull();
+		const stream = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				controller.enqueue(new Uint8Array(4096));
+			},
+		});
+		expect(await readCapped(new Response(stream), 10_000)).toBeNull();
+	});
+});
+
+describe('fetchReceivedEmail', () => {
+	const env = { RESEND_API_KEY: 're_test_key', RESEND_API_BASE: 'https://resend.test/' } as unknown as Env;
+	afterEach(() => vi.unstubAllGlobals());
+
+	it('GETs the email with the key, a User-Agent and a timeout, and trims it', async () => {
+		const fetch = vi.fn(async (_url: string, _init: RequestInit) => Response.json(received()));
+		vi.stubGlobal('fetch', fetch);
+		const result = await fetchReceivedEmail(env, 'e/123', 'alex@example.com');
+		expect(result).toMatchObject({ ok: true, email: { from: 'alex@example.com', subject: 'My guess' } });
+		const [url, init] = fetch.mock.calls[0] as [string, RequestInit];
+		expect(url).toBe('https://resend.test/emails/receiving/e%2F123');
+		expect(new Headers(init.headers).get('authorization')).toBe('Bearer re_test_key');
+		expect(new Headers(init.headers).get('user-agent')).toMatch(/iszacka\.dad/);
+		expect(init.signal).toBeInstanceOf(AbortSignal);
+	});
+
+	it.each([
+		['a 429', async () => new Response('', { status: 429 })],
+		['a 500', async () => new Response('', { status: 500 })],
+		['a network error', async () => Promise.reject(new TypeError('Network connection lost'))],
+		['a timeout', async () => Promise.reject(new DOMException('The operation was aborted due to timeout', 'TimeoutError'))],
+		['a body that is not JSON', async () => new Response('<html>')],
+	])('throws for %s, so the step retries', async (_label, fail) => {
+		vi.stubGlobal('fetch', vi.fn(fail));
+		await expect(fetchReceivedEmail(env, 'e-123')).rejects.toBeInstanceOf(TransientFetchError);
+	});
+
+	it.each([404, 403, 422])('gives up on HTTP %i', async (status) => {
+		vi.spyOn(console, 'error').mockImplementationOnce(() => {});
+		vi.stubGlobal('fetch', vi.fn(async () => Response.json({ name: 'not_found' }, { status })));
+		expect(await fetchReceivedEmail(env, 'e-123')).toEqual({ ok: false, reason: `HTTP ${status}` });
+	});
+
+	it('gives up without an id or a key, without fetching', async () => {
+		const fetch = vi.fn();
+		vi.stubGlobal('fetch', fetch);
+		vi.spyOn(console, 'error').mockImplementationOnce(() => {});
+		expect(await fetchReceivedEmail(env, '')).toEqual({ ok: false, reason: 'no email_id' });
+		expect(await fetchReceivedEmail({ ...env, RESEND_API_KEY: '' } as Env, 'e-123')).toEqual({ ok: false, reason: 'no RESEND_API_KEY' });
+		expect(fetch).not.toHaveBeenCalled();
+	});
+
+	it('does not parse an email over MAX_RECEIVED_BYTES', async () => {
+		const parse = vi.spyOn(JSON, 'parse');
+		vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(received({ html: 'x'.repeat(MAX_RECEIVED_BYTES) })))));
+		expect(await fetchReceivedEmail(env, 'e-123')).toEqual({ ok: false, reason: 'message too large' });
+		expect(parse).not.toHaveBeenCalled();
+		parse.mockRestore();
+	});
+});
+
+// ─── Step 2: decide (real SQL over node:sqlite) ──────────────────────────────
+
+function decideEnv(sentToday = 0) {
+	const sql = sqliteD1();
+	if (sentToday) sql.db.prepare('INSERT INTO email_sends (day, n) VALUES (?, ?)').run(new Date().toISOString().slice(0, 10), sentToday);
 	const env = {
-		DB: db,
-		RESEND_API_KEY: 're_test_key',
-		RESEND_API_BASE: 'https://resend.test',
+		DB: sql.D1,
 		EMAIL_FROM: 'stork@iszacka.dad',
-		EMAIL_FROM_NAME: 'The Stork',
 		EMAIL_REPLY_FROM: 'answer@iszacka.dad',
 		EMAIL_DAILY_LIMIT: '90',
 		ZONE_NAME: 'iszacka.dad',
-		SITE_URL: 'https://iszacka.dad',
-		DNS_RECORD_NAME: 'answer.iszacka.dad',
-		DNS_API_TOKEN: 'dns-token',
 		RL_EMAIL: {},
 	} as unknown as Env;
-	return { env, sent, inbound, fetch };
+	return { env, sql };
 }
 
-/** What Resend's receiving API hands us (after the webhook route has reduced the sender). */
-function email(
-	subject: string,
-	body: string,
-	from = 'alex@example.com',
-	headers: Record<string, string> = {},
-	authentication: InboundEmail['authentication'] = { spf: 'pass', dkim: 'pass', dmarc: 'pass' },
-): InboundEmail {
-	return {
-		from,
-		subject,
-		text: body,
-		html: null,
-		headers: { from: `Alex Example <${from}>`, 'message-id': '<orig-123@example.com>', ...headers },
-		messageId: '<orig-123@example.com>',
-		authentication,
-	};
-}
+const fetched = (over: Partial<FetchedEmail> = {}): FetchedEmail => ({
+	from: 'alex@example.com',
+	subject: 'Well?',
+	text: null,
+	html: null,
+	headers: {},
+	messageId: '<orig-123@example.com>',
+	references: null,
+	authentication: { spf: 'pass', dkim: 'pass', dmarc: 'pass' },
+	...over,
+});
 
-describe('handleInboundEmail', () => {
+describe('decideInbound', () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
-		vi.unstubAllGlobals();
 		mocks.allow.mockResolvedValue(true);
 	});
 
-	it('enters a guess and replies with a threaded confirmation', async () => {
-		const { env, sent, inbound } = fakeEnv();
-		mocks.parseGuessText.mockReturnValue({ guessAt: '2026-11-14T15:30:00.000Z', name: 'Sam' });
-		mocks.submitGuess.mockResolvedValue({ ok: true, id: 7 });
-
-		await handleInboundEmail(email('My guess', '14 Nov 15:30\nName: Sam'), env);
-
-		expect(mocks.parseGuessText.mock.calls[0]?.[0]).toBe('My guess\n14 Nov 15:30\nName: Sam');
-		expect(mocks.submitGuess).toHaveBeenCalledWith(env, {
-			name: 'Sam',
-			guessAt: '2026-11-14T15:30:00.000Z',
-			source: 'email',
-			ipHash: 'hash:alex@example.com',
-		});
-		expect(sent).toHaveLength(1);
-		expect(sent[0]).toMatchObject({ to: 'alex@example.com', subject: 'Re: My guess' });
-		expect(sent[0]?.from).toContain('<answer@iszacka.dad>');
-		expect(sent[0]?.headers).toMatchObject({
-			'Auto-Submitted': 'auto-replied',
-			'In-Reply-To': '<orig-123@example.com>',
-			References: '<orig-123@example.com>',
-		});
-		expect(sent[0]?.text).toContain('#7');
-		expect(sent[0]?.text).not.toContain('Anonymous emailer');
-		expect(inbound).toEqual([['guess', 'hash:alex@example.com', expect.any(String)]]);
-	});
-
-	it('never puts the From display name on the leaderboard, and says so', async () => {
-		const { env, sent } = fakeEnv();
-		mocks.parseGuessText.mockReturnValue({ guessAt: '2026-11-14T15:30:00.000Z' });
-		mocks.submitGuess.mockResolvedValue({ ok: true, id: 8 });
-
-		await handleInboundEmail(email('GUESS', '14 Nov 15:30'), env);
-
-		expect(mocks.submitGuess.mock.calls[0]?.[1]).toMatchObject({ name: ANONYMOUS_NAME });
-		expect(JSON.stringify(mocks.submitGuess.mock.calls)).not.toContain('Alex Example');
-		expect(sent[0]?.text).toContain('Anonymous emailer');
-		expect(sent[0]?.text).toContain('Name: Alex');
-		expect(sent[0]?.html).toContain('Anonymous emailer');
-	});
-
-	it('uses the bare, lower-cased sender for hashing, limits and the reply', async () => {
-		const { env, sent } = fakeEnv();
-		await handleInboundEmail(email('Well?', 'Is Zack a dad yet?', 'Alex Example <Alex@Example.com>'), env);
-		expect(mocks.hashIdentifier).toHaveBeenCalledWith(env, 'alex@example.com');
+	it('answers a human with the status, reading quota and history in one batch', async () => {
+		const { env, sql } = decideEnv();
+		expect(await decideInbound(env, fetched())).toEqual({ action: 'status', fromHash: 'hash:alex@example.com' });
+		expect(sql.log.filter((s) => s.startsWith('SELECT'))).toHaveLength(2);
 		expect(mocks.allow).toHaveBeenCalledWith(env.RL_EMAIL, 'email:hash:alex@example.com');
-		expect(sent[0]?.to).toBe('alex@example.com');
 	});
 
-	it('replies with the error and format help when the guess is rejected', async () => {
-		const { env, sent } = fakeEnv();
-		mocks.parseGuessText.mockReturnValue({ error: "I couldn't find a date in that." });
-		await handleInboundEmail(email('guess', 'whenever'), env);
-		expect(mocks.submitGuess).not.toHaveBeenCalled();
-		expect(sent[0]?.text).toContain("I couldn't find a date in that.");
-		expect(sent[0]?.text).toContain('Subject: guess');
-		expect(sent[0]?.text).not.toContain('name on your email.');
+	it('parses a guess, keeping only an explicit Name: line', async () => {
+		const { env } = decideEnv();
+		mocks.parseGuessText.mockReturnValueOnce({ guessAt: '2026-11-14T15:30:00.000Z', name: '  "Sam" ' });
+		const named = await decideInbound(env, fetched({ subject: 'My guess', text: '14 Nov 15:30\nName: Sam\n> 1 Dec' }));
+		expect(mocks.parseGuessText.mock.calls[0]?.[0]).toBe('My guess\n14 Nov 15:30\nName: Sam');
+		expect(named).toEqual({ action: 'guess', fromHash: 'hash:alex@example.com', guess: { guessAt: '2026-11-14T15:30:00.000Z', name: 'Sam' } });
+
+		mocks.parseGuessText.mockReturnValueOnce({ guessAt: '2026-11-14T15:30:00.000Z' });
+		expect(await decideInbound(env, fetched({ subject: 'GUESS', text: '14 Nov' }))).toMatchObject({ guess: { name: null } });
+
+		mocks.parseGuessText.mockReturnValueOnce({ error: 'No date.' });
+		expect(await decideInbound(env, fetched({ subject: 'guess', text: 'whenever' }))).toMatchObject({ guess: { error: 'No date.' } });
 	});
 
-	it('auto-replies with the answer and stats otherwise', async () => {
-		const { env, sent, inbound } = fakeEnv();
-		await handleInboundEmail(email('Well?', 'Is Zack a dad yet?'), env);
-		expect(mocks.parseGuessText).not.toHaveBeenCalled();
-		expect(sent[0]?.subject).toBe('Re: Well?');
-		expect(sent[0]?.text).toContain('Zack is not a dad. Yet.');
-		expect(sent[0]?.text).toContain('dig +short TXT answer.iszacka.dad');
-		expect(inbound[0]?.[0]).toBe('status');
+	it('checks robots and authentication before spending the rate limit', async () => {
+		const { env } = decideEnv();
+		expect(await decideInbound(env, fetched({ headers: { 'auto-submitted': 'auto-replied' } }))).toMatchObject({
+			action: 'ignore',
+			reason: 'Auto-Submitted',
+		});
+		expect(await decideInbound(env, fetched({ authentication: { dkim: 'fail', dmarc: 'fail' } }))).toMatchObject({
+			reason: 'sender not authenticated',
+		});
+		expect(await decideInbound(env, fetched({ from: '' }))).toMatchObject({ reason: 'null sender (bounce)', fromHash: null });
+		expect(mocks.allow).not.toHaveBeenCalled();
 	});
 
-	it('never replies to auto-responders or bounces, but still counts them', async () => {
-		const { env, sent, inbound } = fakeEnv();
-		await handleInboundEmail(email('Out of office', 'Away', undefined, { 'auto-submitted': 'auto-replied' }), env);
-		await handleInboundEmail(email('Undeliverable', 'Bounce', undefined, { 'return-path': '<>' }), env);
-		await handleInboundEmail(email('Hi', 'Hi', ''), env);
-		expect(sent).toHaveLength(0);
-		expect(inbound.map((row) => row[0])).toEqual(['ignored', 'ignored', 'ignored']);
+	it('counts this email towards the reserve: 78 sent leaves room, 79 does not', async () => {
+		expect(await decideInbound(decideEnv(78).env, fetched())).toMatchObject({ action: 'status' });
+		expect(await decideInbound(decideEnv(79).env, fetched())).toMatchObject({ reason: 'daily send quota down to the reserve' });
+		expect(mocks.allow).toHaveBeenCalledTimes(1);
 	});
 
-	it('respects the per-sender rate limit', async () => {
-		const { env, sent, inbound } = fakeEnv();
-		mocks.allow.mockResolvedValue(false);
-		await handleInboundEmail(email('Hi', 'Hi'), env);
-		expect(sent).toHaveLength(0);
-		expect(inbound[0]?.[0]).toBe('ignored');
+	it('applies the per-minute and per-day limits', async () => {
+		const { env, sql } = decideEnv();
+		mocks.allow.mockResolvedValueOnce(false);
+		expect(await decideInbound(env, fetched())).toMatchObject({ reason: 'per-minute limit' });
+		const insert = sql.db.prepare('INSERT INTO inbound_emails (kind, from_hash, at) VALUES (?, ?, ?)');
+		const recent = new Date(Date.now() - 3_600_000).toISOString();
+		for (let i = 0; i < 20; i++) insert.run('status', 'hash:alex@example.com', recent);
+		expect(await decideInbound(env, fetched())).toMatchObject({ reason: 'daily limit' });
 	});
 
-	it("doesn't crash without RESEND_API_KEY: the email is recorded, the reply isn't sent", async () => {
-		const { env, sent, inbound, fetch } = fakeEnv();
-		(env as { RESEND_API_KEY?: string }).RESEND_API_KEY = undefined;
-		await expect(handleInboundEmail(email('Well?', 'Hello'), env)).resolves.toBeUndefined();
-		expect(fetch).not.toHaveBeenCalled();
-		expect(sent).toHaveLength(0);
-		expect(inbound[0]?.[0]).toBe('status');
+	it('fails open if D1 is down, as the quota always has', async () => {
+		const { env, sql } = decideEnv(85);
+		sql.failBatches(1);
+		vi.spyOn(console, 'error').mockImplementationOnce(() => {});
+		expect(await decideInbound(env, fetched())).toMatchObject({ action: 'status' });
+	});
+});
+
+// ─── Step 5: record ──────────────────────────────────────────────────────────
+
+describe('recordInbound', () => {
+	const day = '2026-11-07';
+	const now = new Date(`${day}T10:00:00.000Z`);
+
+	it('records and counts each email exactly once, however often it runs', async () => {
+		const { env, sql } = decideEnv();
+		expect(await recordInbound(env, 'inbound-msg_1', 'status', 'hash:a', now)).toBe(true);
+		expect(await recordInbound(env, 'inbound-msg_1', 'status', 'hash:a', now)).toBe(false);
+		expect(await recordInbound(env, 'inbound-msg_1', 'ignored', null, now)).toBe(false);
+		expect(await recordInbound(env, 'inbound-msg_2', 'ignored', null, now)).toBe(true);
+		expect(sql.rows('SELECT day, n FROM email_sends')).toEqual([{ day, n: 2 }]);
+		expect(sql.rows('SELECT kind, from_hash FROM inbound_emails ORDER BY id')).toEqual([
+			{ kind: 'status', from_hash: 'hash:a' },
+			{ kind: 'ignored', from_hash: null },
+		]);
+		expect(sql.rows("SELECT svix_id FROM resend_events WHERE type = 'inbound.recorded' ORDER BY svix_id")).toEqual([
+			{ svix_id: 'inbound-msg_1' },
+			{ svix_id: 'inbound-msg_2' },
+		]);
 	});
 
-	it('ignores senders Resend could not authenticate: no reply, no guess', async () => {
-		const { env, sent, inbound } = fakeEnv();
-		mocks.parseGuessText.mockReturnValue({ guessAt: '2026-11-14T15:30:00.000Z', name: 'Sam' });
-		await handleInboundEmail(email('guess', '14 Nov 15:30', undefined, {}, { spf: 'pass', dkim: 'fail', dmarc: 'fail' }), env);
-		await handleInboundEmail(email('Your account is locked', 'Hi', undefined, {}, null), env);
-		await handleInboundEmail(email('Hi', 'Hi', undefined, {}, { dkim: 'gray', dmarc: 'gray' }), env);
-		// Forged headers don't count: only Resend's structured verdicts do.
-		const forged = email('Hi', 'Hi', undefined, { 'authentication-results': 'mx.example.com; dkim=pass; dmarc=pass' });
-		await handleInboundEmail({ ...forged, authentication: undefined }, env);
-		expect(sent).toHaveLength(0);
-		expect(mocks.submitGuess).not.toHaveBeenCalled();
-		expect(inbound.map((row) => row[0])).toEqual(['ignored', 'ignored', 'ignored', 'ignored']);
+	it('adds to the day the reply sends already counted', async () => {
+		const { env, sql } = decideEnv(5);
+		await recordInbound(env, 'inbound-msg_3', 'guess', 'hash:b');
+		expect(sql.rows('SELECT n FROM email_sends')).toEqual([{ n: 6 }]);
 	});
 
-	it('replies to an aligned DKIM pass even when DMARC is gray (p=none)', async () => {
-		const { env, sent } = fakeEnv();
-		await handleInboundEmail(email('Well?', 'Is Zack a dad yet?', undefined, {}, { spf: 'pass', dkim: 'pass', dmarc: 'gray' }), env);
-		expect(sent).toHaveLength(1);
-	});
-
-	it('keeps the last emails of the day for real news', async () => {
-		const { env, sent, inbound } = fakeEnv(80);
-		mocks.parseGuessText.mockReturnValue({ guessAt: '2026-11-14T15:30:00.000Z', name: 'Sam' });
-		await handleInboundEmail(email('guess', '14 Nov 15:30'), env);
-		expect(sent).toHaveLength(0);
-		expect(mocks.submitGuess).not.toHaveBeenCalled();
-		expect(inbound[0]?.[0]).toBe('ignored');
-	});
-
-	it('only advertises dig when the DNS record is kept up to date', async () => {
-		const { env, sent } = fakeEnv();
-		(env as { DNS_API_TOKEN?: string }).DNS_API_TOKEN = undefined;
-		await handleInboundEmail(email('Well?', 'Is Zack a dad yet?'), env);
-		expect(sent[0]?.text).not.toContain('dig +short');
-	});
-
-	it('never throws, even when everything is on fire', async () => {
-		const { env } = fakeEnv();
-		mocks.getState.mockRejectedValueOnce(new Error('D1 is down'));
-		await expect(handleInboundEmail(email('Hi', 'Hi'), env)).resolves.toBeUndefined();
+	it('throws (so the step retries) when D1 is down, having written nothing', async () => {
+		const { env, sql } = decideEnv();
+		sql.failBatches(1);
+		await expect(recordInbound(env, 'inbound-msg_4', 'status', null, now)).rejects.toThrow(/outage/);
+		expect(sql.rows('SELECT * FROM inbound_emails')).toEqual([]);
+		expect(await recordInbound(env, 'inbound-msg_4', 'status', null, now)).toBe(true);
+		expect(sql.rows('SELECT n FROM email_sends')).toEqual([{ n: 1 }]);
 	});
 });

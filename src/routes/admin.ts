@@ -1,6 +1,6 @@
 // OWNER: admin agent.
 // Mounted at /admin. Login/logout, dashboard, the big red button, due date, stats,
-// recent updates (+ notification re-runs), reload-every-browser, test sends, OG + DNS.
+// recent updates (+ notification re-runs), reload-every-browser, test sends, DNS.
 // Every POST: requireAdmin (session + same-origin check), then a 303 back to /admin with the
 // outcome in a one-shot flash cookie (or JSON when the client sends Accept: application/json).
 // No page renders text taken from its URL: the login page only knows fixed ?done= codes.
@@ -38,7 +38,6 @@ import { deliverySummary, type DeliverySummary } from '../lib/deliveries';
 import type { Html } from '../lib/layout';
 import { getLedger, type LedgerEntry } from '../lib/ledger';
 import { broadcast, liveStats } from '../lib/live';
-import { renderOgImage } from '../lib/og';
 import {
 	allow,
 	clientIp,
@@ -52,7 +51,7 @@ import {
 } from '../lib/security';
 import { STATUS_COPY, siteUrl } from '../lib/site';
 import { getState, setDueDate, setSetting, setStatus } from '../lib/state';
-import { addDays, daysBetween, formatLondon, formatLondonDate, isYmd, londonDate, nowIso } from '../lib/time';
+import { addDays, daysBetween, formatLondon, formatLondonDate, formatNumber, isYmd, londonDate, nowIso } from '../lib/time';
 import { getUpdate, listUpdates, startAnnouncement } from '../lib/updates';
 import { updateAnswerRecord } from '../notify/dns';
 import { emailDailyLimit, emailSendsToday, sendTestEmail } from '../notify/email';
@@ -73,8 +72,6 @@ const UNDO_WINDOW_MS = 60_000;
 const MAX_NOTE_LENGTH = 500;
 const RECENT_UPDATES = 10;
 const LEDGER_HEAD = 5;
-
-const numberFormat = new Intl.NumberFormat('en-GB');
 
 // ─── Small helpers ──────────────────────────────────────────────────────────
 
@@ -125,11 +122,11 @@ function action(name: string, handler: (c: Ctx) => Promise<Response>) {
 }
 
 function fmt(n: number | null): string {
-	return n === null ? '?' : numberFormat.format(n);
+	return n === null ? '?' : formatNumber(n);
 }
 
 function plural(n: number, one: string, many = `${one}s`): string {
-	return `${numberFormat.format(n)} ${n === 1 ? one : many}`;
+	return `${formatNumber(n)} ${n === 1 ? one : many}`;
 }
 
 function relativeDays(days: number): string {
@@ -648,15 +645,6 @@ function toolsSection(env: Env, viewers: number | null): Html {
 				<button type="submit" class="btn">Send test</button>
 			</form>
 
-			<form method="post" action="/admin/og/render" class="card form stack">
-				<h3 class="card-title">Re-render the social card</h3>
-				<p class="hint">
-					Browser Rendering screenshots the current card into <code>/og.png</code>. Takes a few seconds and a small
-					amount of someone else's electricity.
-				</p>
-				<button type="submit" class="btn">Render /og.png</button>
-			</form>
-
 			<form method="post" action="/admin/dns/sync" class="card form stack">
 				<h3 class="card-title">Sync the DNS answer</h3>
 				<p class="hint">
@@ -1089,21 +1077,16 @@ adminRoutes.post(
 	}),
 );
 
-adminRoutes.post(
-	'/og/render',
-	requireAdmin,
-	action('OG render', async (c) => {
-		// Browser Rendering limits are shared across the account; one session can't hog them.
-		if (!(await allow(c.env.RL_EMAIL, 'admin-og-render'))) {
-			return respond(c, false, 'The social card was rendered moments ago. Give the headless browser a minute.', { status: 429 });
-		}
-		const result = await renderOgImage(c.env);
-		const detail = result.detail ? ` (${result.detail})` : '';
-		return result.ok
-			? respond(c, true, `Social card re-rendered${detail}.`, { data: { result } })
-			: respond(c, false, `Social card render failed${detail}.`, { status: 502, data: { result } });
-	}),
-);
+/** Shown to anyone who reaches the old "Re-render the social card" action (a stale tab or bookmark). */
+export const OG_RENDER_GONE =
+	'The social card is no longer rendered live: /og.png serves the pre-rendered card for the current status, so there is nothing to re-render.';
+
+// The live OG render (headless Chromium) is gone: it cost far more than the Workers Free
+// 10 ms CPU budget. Old forms and bookmarks land back on the dashboard with a fixed notice.
+adminRoutes.on(['GET', 'POST'], '/og/render', requireAdmin, (c) => {
+	if (wantsJson(c)) return c.json({ ok: false, message: OG_RENDER_GONE }, 410);
+	return flashRedirect(c, 'ok', OG_RENDER_GONE);
+});
 
 adminRoutes.post(
 	'/dns/sync',
