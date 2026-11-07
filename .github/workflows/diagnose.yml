@@ -44,6 +44,10 @@ jobs:
           r "/emails/receiving?limit=5" | jq -r '
             if .data then .data[] | "\(.created_at)  to-domain=\([.to[]? | sub(".*@";"")] | unique | join(","))  id=…\(.id[-4:])"
             else "list failed: \(.name // "?") \(.message // "" | gsub("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+";"<email>"))" end'
+          echo "── Latest sent emails (recipients redacted to their domain)"
+          r "/emails?limit=8" | jq -r '
+            if .data then .data[] | "\(.created_at)  from=\(.from | sub(".*<";"") | sub(">.*";""))  to-domain=\([.to[]? | sub(".*@";"") | sub(">.*";"")] | unique | join(","))  last_event=\(.last_event // "?")"
+            else "list failed: \(.name // "?") \(.message // "" | gsub("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+";"<email>"))" end'
           id=$(r "/emails/receiving?limit=1" | jq -r '.data[0].id // empty')
           if [[ -n $id ]]; then
             echo "── Newest received email: authentication + header flags"
@@ -66,6 +70,7 @@ jobs:
       - name: Tail the Worker while the smoke test runs (redacted)
         env:
           MINUTES: ${{ inputs.tail_minutes }}
+        if: ${{ inputs.tail_minutes > 0 }}
         run: |
           set +e
           timeout "${MINUTES}m" npx wrangler tail iszacka-dad --env="" --format json > tail.json 2> tail.err &
