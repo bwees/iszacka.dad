@@ -11,13 +11,17 @@ import { ROOT, run, scratchDir, writeExecutable } from './infra-helpers';
 
 const SCRIPT = join(ROOT, 'scripts/setup-cloudflare.sh');
 const TOKEN = 'test-token-not-a-real-one';
-const RESEND_KEY = 're_test_key_not_a_real_one';
+// Fake credentials, assembled at runtime so secret scanners don't mistake them for real ones
+// (Resend/Svix webhook secrets share Stripe's whsec_ prefix).
+const fake = (prefix: string, text: string) => `${prefix}_${Buffer.from(text).toString('base64')}`;
+const RESEND_KEY = fake('re', 'test-key-not-a-real-one');
 const ZONE_ID = 'zone0000000000000000000000000001';
 const ACCOUNT_ID = 'acct0000000000000000000000000001';
 const SITE_KEY = '0x4AAAAAAAsmoketestsitekey';
 const TURNSTILE_SECRET = '0x4AAAAAAAsmoketestsecret';
 const ROTATED_SECRET = '0x4AAAAAAArotatedsecret';
-const WEBHOOK_SECRET = 'whsec_dGVzdC1zaWduaW5nLXNlY3JldA==';
+const WEBHOOK_SECRET = fake('whsec', 'test-signing-secret');
+const OLD_WEBHOOK_SECRET = fake('whsec', 'old');
 const WEBHOOK_URL = 'https://iszacka.dad/api/resend/webhook';
 const DKIM = 'p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDtestkeyAB';
 
@@ -448,7 +452,7 @@ describe('setup-cloudflare.sh', () => {
 	});
 
 	it('recreates a webhook whose secret it cannot read, when the Worker lacks it', async () => {
-		state.webhooks.push({ id: 'hook-old', endpoint: WEBHOOK_URL, events: ['email.received'], status: 'disabled', signing_secret: 'whsec_b2xk' });
+		state.webhooks.push({ id: 'hook-old', endpoint: WEBHOOK_URL, events: ['email.received'], status: 'disabled', signing_secret: OLD_WEBHOOK_SECRET });
 		state.hideWebhookSecret = true;
 		const result = await setup();
 		expect(result.code, result.stdout + result.stderr).toBe(0);
@@ -459,11 +463,11 @@ describe('setup-cloudflare.sh', () => {
 	});
 
 	it('uses a readable webhook secret without recreating anything', async () => {
-		state.webhooks.push({ id: 'hook-old', endpoint: WEBHOOK_URL, events: ['email.received', 'email.bounced', 'email.complained'], status: 'enabled', signing_secret: 'whsec_b2xk' });
+		state.webhooks.push({ id: 'hook-old', endpoint: WEBHOOK_URL, events: ['email.received', 'email.bounced', 'email.complained'], status: 'enabled', signing_secret: OLD_WEBHOOK_SECRET });
 		const result = await setup();
 		expect(result.code, result.stdout + result.stderr).toBe(0);
 		expect(requests.some((r) => r.api === 'resend' && r.path.startsWith('/webhooks') && r.method !== 'GET')).toBe(false);
-		expect(workerSecrets().RESEND_WEBHOOK_SECRET).toBe('whsec_b2xk');
+		expect(workerSecrets().RESEND_WEBHOOK_SECRET).toBe(OLD_WEBHOOK_SECRET);
 	});
 
 	it('rotates the Turnstile secret when the widget exists but its secret is unreadable and the Worker lacks it', async () => {
