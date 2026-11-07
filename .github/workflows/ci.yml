@@ -1,0 +1,123 @@
+# CI: typecheck, unit tests, shell lint, and a full smoke test against `wrangler dev`
+# (local D1, Durable Object, Workflow and all) on every pull request and every push to main.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  WRANGLER_SEND_METRICS: "false"
+  FORCE_COLOR: "0"
+
+jobs:
+  check:
+    name: Typecheck, tests & lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Unit tests
+        run: npx vitest run
+
+      - name: Lint shell scripts
+        run: shellcheck scripts/*.sh .github/scripts/*.sh
+
+  smoke:
+    name: Smoke test (wrangler dev)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DEV_URL: http://localhost:8787
+      DEV_LOG: ${{ github.workspace }}/wrangler-dev.log
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Apply D1 migrations (local)
+        run: npx wrangler d1 migrations apply iszackadad --local
+
+      - name: Write .dev.vars
+        run: printf 'ADMIN_PASSWORD=ci\n' > .dev.vars
+
+      # --infer-origin-from-routes=false: otherwise wrangler dev tells the Worker every request
+      # arrived at https://iszacka.dad (the first route), and same-origin checks can't match.
+      - name: Start wrangler dev
+        run: |
+          nohup npx wrangler dev --port 8787 --infer-origin-from-routes=false \
+            --show-interactive-dev-session=false >"$DEV_LOG" 2>&1 &
+          echo "WRANGLER_DEV_PID=$!" >>"$GITHUB_ENV"
+
+      - name: Wait for wrangler dev
+        run: |
+          for _ in $(seq 1 120); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$DEV_URL/" || true)
+            if [[ $code =~ ^[1-5][0-9][0-9]$ ]]; then
+              echo "wrangler dev is answering (HTTP $code)."
+              exit 0
+            fi
+            if ! kill -0 "$WRANGLER_DEV_PID" 2>/dev/null; then
+              echo "::error title=wrangler dev exited::wrangler dev stopped before it was ready."
+              tail -n 100 "$DEV_LOG"
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "::error title=wrangler dev timeout::wrangler dev wasn't ready after 120 seconds."
+          tail -n 100 "$DEV_LOG"
+          exit 1
+
+      - name: Smoke test
+        env:
+          ADMIN_PASSWORD: ci
+        run: bash scripts/smoke.sh "$DEV_URL" --mutate
+
+      - name: Show the end of the wrangler log
+        if: failure()
+        run: tail -n 200 "$DEV_LOG" || true
+
+      - name: Upload the wrangler log
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: wrangler-dev-log
+          path: wrangler-dev.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Stop wrangler dev
+        if: always()
+        run: |
+          if [[ -n ${WRANGLER_DEV_PID:-} ]]; then kill "$WRANGLER_DEV_PID" 2>/dev/null || true; fi
+          pkill -f 'wrangler dev --port 8787' 2>/dev/null || true

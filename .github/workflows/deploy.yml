@@ -1,0 +1,127 @@
+# Production deploy: every push to main (or a manual run) typechecks, tests, resolves the
+# D1 database by name, applies migrations, deploys the Worker to iszacka.dad, syncs the
+# Worker secrets from GitHub secrets, and finally smoke-tests production (read-only).
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One production deploy at a time, in order. Never cancel one halfway through a migration.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  WRANGLER_SEND_METRICS: "false"
+  FORCE_COLOR: "0"
+  SITE_URL: https://iszacka.dad
+
+jobs:
+  deploy:
+    name: Deploy to iszacka.dad
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: production
+      url: https://iszacka.dad
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Unit tests
+        run: npx vitest run
+
+      - name: Check Cloudflare credentials
+        run: |
+          missing=0
+          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID; do
+            if [[ -z ${!name:-} ]]; then
+              echo "::error title=Missing secret::$name isn't set. See docs/SETUP.md."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Resolve the D1 database
+        id: d1
+        run: bash .github/scripts/ensure-d1.sh iszackadad PLACEHOLDER_D1_ID
+
+      - name: Apply D1 migrations (remote)
+        run: npx wrangler d1 migrations apply iszackadad --remote --env=""
+
+      - name: Deploy the Worker
+        env:
+          DEPLOY_SHA: ${{ github.sha }}
+        # --env="" picks the top-level (production) config explicitly; [env.preview] is for PRs.
+        run: npx wrangler deploy --env="" --message "GitHub Actions deploy of ${DEPLOY_SHA:0:12}"
+
+      # The Worker has to exist before it can have secrets, so these go after the first deploy.
+      # A secret that isn't set in GitHub is left alone on the Worker (never deleted).
+      # TURNSTILE_SITE_KEY, TURNSTILE_SECRET_KEY and RESEND_WEBHOOK_SECRET belong to the Setup
+      # workflow (scripts/setup-cloudflare.sh); they're only synced from GitHub if someone set
+      # them there on purpose, as overrides.
+      - name: Sync Worker secrets
+        env:
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          DNS_API_TOKEN: ${{ secrets.DNS_API_TOKEN }}
+          DNS_ZONE_ID: ${{ secrets.DNS_ZONE_ID }}
+          TURNSTILE_SITE_KEY: ${{ secrets.TURNSTILE_SITE_KEY }}
+          TURNSTILE_SECRET_KEY: ${{ secrets.TURNSTILE_SECRET_KEY }}
+          RESEND_WEBHOOK_SECRET: ${{ secrets.RESEND_WEBHOOK_SECRET }}
+        run: |
+          for name in ADMIN_PASSWORD RESEND_API_KEY DNS_API_TOKEN DNS_ZONE_ID TURNSTILE_SITE_KEY TURNSTILE_SECRET_KEY RESEND_WEBHOOK_SECRET; do
+            value=${!name:-}
+            if [[ -z $value ]]; then
+              case $name in
+                ADMIN_PASSWORD)
+                  echo "::warning title=No admin password::ADMIN_PASSWORD isn't set in GitHub secrets. Unless the Worker already has one, /admin stays locked." ;;
+                RESEND_API_KEY)
+                  echo "::warning title=No Resend key::RESEND_API_KEY isn't set in GitHub secrets. Unless the Worker already has one, no email goes out." ;;
+                DNS_API_TOKEN | DNS_ZONE_ID)
+                  echo "::notice title=Secret skipped::$name isn't set in GitHub secrets; leaving the Worker's value (if any) alone." ;;
+                *)
+                  echo "$name: managed by the Setup workflow; not overridden from GitHub." ;;
+              esac
+              continue
+            fi
+            printf '%s' "$value" | npx wrangler secret put "$name" --env=""
+          done
+
+      # Brand new custom domains can take a few minutes to get a certificate, so wait for the
+      # site to answer before judging it.
+      - name: Wait for production
+        run: |
+          for _ in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$SITE_URL/api/status" || true)
+            if [[ $code == 200 ]]; then
+              echo "$SITE_URL is answering."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error title=Production unreachable::$SITE_URL/api/status didn't return 200 within 5 minutes."
+          exit 1
+
+      - name: Smoke test production (read-only)
+        run: bash scripts/smoke.sh "$SITE_URL"

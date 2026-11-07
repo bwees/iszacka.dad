@@ -1,0 +1,236 @@
+# Per-PR previews: every pull request from this repository gets its own throwaway Worker,
+# iszacka-dad-pr<N>.<account>.workers.dev, backed by the shared iszackadad_preview D1, with
+# Turnstile test keys (see [env.preview] in wrangler.toml). Previews are public, so the admin
+# password is the PREVIEW_ADMIN_PASSWORD repository secret, stored on the Worker as a secret
+# and never printed; without it, preview admin is off.
+# One PR comment (found by a hidden marker) tracks it. Closing the PR deletes the Worker.
+#
+# Fork PRs are skipped: they get no secrets, and nobody wants a stranger's code on our account.
+name: Preview
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: preview-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  WRANGLER_SEND_METRICS: "false"
+  FORCE_COLOR: "0"
+  PR_NUMBER: ${{ github.event.pull_request.number }}
+  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+  WORKER_NAME: iszacka-dad-pr${{ github.event.pull_request.number }}
+  WORKFLOW_NAME: iszacka-dad-announce-pr${{ github.event.pull_request.number }}
+  PREVIEW_DB: iszackadad_preview
+
+jobs:
+  deploy:
+    name: Deploy preview
+    if: >-
+      github.event.action != 'closed' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - name: Check Cloudflare credentials
+        id: creds
+        run: |
+          if [[ -n ${CLOUDFLARE_API_TOKEN:-} && -n ${CLOUDFLARE_ACCOUNT_ID:-} ]]; then
+            echo "ok=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >>"$GITHUB_OUTPUT"
+            echo "::notice title=No preview::CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID aren't set, so there's no preview. See docs/SETUP.md."
+          fi
+
+      - uses: actions/checkout@v7
+        if: steps.creds.outputs.ok == 'true'
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        if: steps.creds.outputs.ok == 'true'
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Comment that it's building
+        if: steps.creds.outputs.ok == 'true'
+        uses: actions/github-script@v9
+        env:
+          PREVIEW_STATE: building
+        with:
+          script: |
+            const run = require('./.github/scripts/preview-comment.cjs');
+            await run({ github, context });
+
+      - name: Install dependencies
+        if: steps.creds.outputs.ok == 'true'
+        run: npm ci
+
+      - name: Resolve the preview D1 database
+        if: steps.creds.outputs.ok == 'true'
+        run: bash .github/scripts/ensure-d1.sh "$PREVIEW_DB" PLACEHOLDER_D1_PREVIEW_ID
+
+      # Workflow names are unique per account, so each preview Worker needs its own.
+      - name: Give this preview its own Workflow
+        if: steps.creds.outputs.ok == 'true'
+        run: |
+          found=$(grep -c '"iszacka-dad-announce-preview"' wrangler.toml || true)
+          if [[ $found != 1 ]]; then
+            echo "::error::Expected the preview Workflow name exactly once in wrangler.toml, found it $found time(s)."
+            exit 1
+          fi
+          sed -i "s/\"iszacka-dad-announce-preview\"/\"$WORKFLOW_NAME\"/" wrangler.toml
+          grep -q "\"$WORKFLOW_NAME\"" wrangler.toml
+
+      - name: Apply D1 migrations (preview)
+        if: steps.creds.outputs.ok == 'true'
+        run: |
+          # The preview D1 is shared by every PR, and wrangler doesn't lock it while migrating.
+          # If another PR's preview applies the same migration first, ours fails with
+          # "already exists". A retry re-reads d1_migrations and skips what the other run applied.
+          for attempt in 1 2 3; do
+            if npx wrangler d1 migrations apply "$PREVIEW_DB" --env preview --remote; then exit 0; fi
+            echo "::warning::Migrating $PREVIEW_DB failed (attempt $attempt); another preview may be migrating it too. Retrying."
+            sleep $((attempt * 10))
+          done
+          exit 1
+
+      - name: Deploy the preview Worker
+        id: deploy
+        if: steps.creds.outputs.ok == 'true'
+        env:
+          PREVIEW_ADMIN_PASSWORD: ${{ secrets.PREVIEW_ADMIN_PASSWORD }}
+        run: |
+          # The admin password goes up as a Worker secret with the deploy. Never as --var:
+          # vars are printed in wrangler's bindings table, and deploy.log is public.
+          secret_args=()
+          secrets_file="$RUNNER_TEMP/preview-secrets.json"
+          if [[ -n ${PREVIEW_ADMIN_PASSWORD:-} ]]; then
+            (umask 077; jq -n --arg p "$PREVIEW_ADMIN_PASSWORD" '{ADMIN_PASSWORD: $p}' >"$secrets_file")
+            secret_args=(--secrets-file "$secrets_file")
+          else
+            echo "::notice title=Preview admin is off::Set the PREVIEW_ADMIN_PASSWORD repository secret to use /admin on previews."
+          fi
+
+          # Point SITE_URL at the preview itself (links in feeds, emails and OG tags) when we
+          # can work out the account's workers.dev subdomain up front.
+          subdomain=$(curl -sS --max-time 20 \
+            -H @<(printf 'Authorization: Bearer %s\n' "$CLOUDFLARE_API_TOKEN") \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain" |
+            jq -r 'select(.success == true) | .result.subdomain // empty' || true)
+          site_args=()
+          if [[ $subdomain =~ ^[a-z0-9-]+$ ]]; then
+            site_args=(--var "SITE_URL:https://$WORKER_NAME.$subdomain.workers.dev")
+          fi
+
+          npx wrangler deploy --env preview --name "$WORKER_NAME" \
+            --message "Preview of PR #$PR_NUMBER at ${HEAD_SHA:0:12}" \
+            "${site_args[@]}" "${secret_args[@]}" 2>&1 | tee deploy.log
+          rm -f "$secrets_file"
+
+          url=$(grep -Eo "https://$WORKER_NAME\.[a-z0-9-]+\.workers\.dev" deploy.log | head -n 1 || true)
+          if [[ -z $url && $subdomain =~ ^[a-z0-9-]+$ ]]; then
+            url="https://$WORKER_NAME.$subdomain.workers.dev"
+          fi
+          if [[ -z $url ]]; then
+            echo "::error::Couldn't find the workers.dev URL in the deploy output. Is workers.dev enabled on the account?"
+            exit 1
+          fi
+          echo "url=$url" >>"$GITHUB_OUTPUT"
+          echo "Preview deployed: $url" >>"$GITHUB_STEP_SUMMARY"
+
+      # A brand new workers.dev hostname can take a little while to resolve everywhere.
+      - name: Wait for the preview
+        if: steps.deploy.outputs.url != ''
+        env:
+          PREVIEW_URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          for _ in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$PREVIEW_URL/api/status" || true)
+            if [[ $code == 200 ]]; then exit 0; fi
+            sleep 3
+          done
+          echo "::warning::$PREVIEW_URL/api/status didn't return 200 within 3 minutes."
+
+      # Read-only: the preview D1 is shared by every open PR, so no button pressing here.
+      - name: Smoke test the preview
+        id: smoke
+        if: steps.deploy.outputs.url != ''
+        continue-on-error: true
+        env:
+          PREVIEW_URL: ${{ steps.deploy.outputs.url }}
+        run: bash scripts/smoke.sh "$PREVIEW_URL"
+
+      - name: Comment with the result
+        if: ${{ !cancelled() && steps.creds.outputs.ok == 'true' }}
+        uses: actions/github-script@v9
+        env:
+          PREVIEW_STATE: ${{ steps.deploy.outputs.url != '' && 'ready' || 'failed' }}
+          PREVIEW_URL: ${{ steps.deploy.outputs.url }}
+          SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
+        with:
+          script: |
+            const run = require('./.github/scripts/preview-comment.cjs');
+            await run({ github, context });
+
+      - name: Fail if the preview smoke test failed
+        if: steps.smoke.outcome == 'failure'
+        run: |
+          echo "::error title=Preview smoke test failed::See the 'Smoke test the preview' step."
+          exit 1
+
+  cleanup:
+    name: Delete preview
+    if: >-
+      github.event.action == 'closed' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Tolerant on purpose: the preview may never have deployed (no secrets, failed build),
+      # or someone may already have tidied it up by hand.
+      - name: Delete the preview Worker and its Workflow
+        run: |
+          if [[ -z ${CLOUDFLARE_API_TOKEN:-} || -z ${CLOUDFLARE_ACCOUNT_ID:-} ]]; then
+            echo "::notice::No Cloudflare credentials, so there's nothing to delete."
+            exit 0
+          fi
+          npx wrangler delete "$WORKER_NAME" --force ||
+            echo "::warning::Couldn't delete the $WORKER_NAME Worker (maybe it never existed)."
+          npx wrangler workflows delete "$WORKFLOW_NAME" ||
+            echo "::notice::Couldn't delete the $WORKFLOW_NAME Workflow (maybe it left with the Worker)."
+
+      - name: Update the preview comment
+        if: ${{ !cancelled() }}
+        uses: actions/github-script@v9
+        env:
+          PREVIEW_STATE: deleted
+        with:
+          script: |
+            const run = require('./.github/scripts/preview-comment.cjs');
+            await run({ github, context });

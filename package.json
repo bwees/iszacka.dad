@@ -1,0 +1,29 @@
+{
+  "name": "iszacka.dad",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Is Zack a dad? An extremely overengineered answer to a yes/no question.",
+  "scripts": {
+    "dev": "wrangler dev --infer-origin-from-routes=false",
+    "types": "wrangler types --strict-vars=false",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run test",
+    "db:migrate:local": "wrangler d1 migrations apply iszackadad --local",
+    "db:migrate:remote": "wrangler d1 migrations apply iszackadad --remote",
+    "smoke": "bash scripts/smoke.sh",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@cloudflare/puppeteer": "^1.4.0",
+    "hono": "^4.13.16",
+    "qrcode-generator": "^2.0.4"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0",
+    "wrangler": "^4.158.0"
+  }
+}

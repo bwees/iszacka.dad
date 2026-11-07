@@ -1,0 +1,161 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# iszacka.dad: an extremely overengineered answer to a yes/no question.
+#
+# One Worker serves the whole site:
+#   * static assets from ./public (CSS, client JS, service worker, icons)
+#   * server routes (pages, feeds, API, MCP, admin) via Hono in src/index.ts
+#   * a Durable Object ("WaitingRoom") for live WebSockets / SSE
+#   * a Workflow ("AnnounceWorkflow") that fans notifications out with retries
+#   * a daily cron, a Resend inbound-email webhook, and Browser Rendering for OG images
+#
+# Email is Resend (https://resend.com), both ways: notifications and auto-replies
+# go out via the API (RESEND_API_KEY), inbound *@iszacka.dad mail arrives as a
+# signed webhook (POST /api/resend/webhook, verified with RESEND_WEBHOOK_SECRET).
+# EMAIL_DAILY_LIMIT keeps us under Resend's 100 emails/day free quota.
+#
+# The D1 `database_id` values are placeholders. CI resolves the real ids by
+# database name (creating the database on first deploy) and injects them, so
+# no ids are committed. Local dev uses a local SQLite file automatically.
+#
+# Secrets (never committed; set by CI from GitHub secrets, or `wrangler secret put`):
+#   ADMIN_PASSWORD         password for /admin (required for admin)
+#   RESEND_API_KEY         Resend full-access key (required for any email)
+#   RESEND_WEBHOOK_SECRET  Resend webhook signing secret (required for inbound email;
+#                          installed by scripts/setup-cloudflare.sh)
+#   TURNSTILE_SITE_KEY     Turnstile site key (public, but stored as a secret so the setup
+#   TURNSTILE_SECRET_KEY   job can install both halves without a commit; forms skip the
+#                          check unless both are set; installed by setup-cloudflare.sh)
+#   DNS_API_TOKEN          token with DNS:Edit on the zone (optional; enables the
+#                          live `dig TXT answer.iszacka.dad` record)
+# ─────────────────────────────────────────────────────────────────────────────
+name = "iszacka-dad"
+main = "src/index.ts"
+compatibility_date = "2026-10-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Static assets win for any path that exists in ./public; everything else runs the Worker.
+assets = { directory = "./public", binding = "ASSETS" }
+
+# Production custom domains. Wrangler creates the DNS records and certificates.
+routes = [
+  { pattern = "iszacka.dad", custom_domain = true },
+  { pattern = "www.iszacka.dad", custom_domain = true },
+]
+
+[observability]
+enabled = true
+
+# 09:00 UTC daily: "Day N: still no." post, daily digest, OG image refresh, cleanup.
+[triggers]
+crons = ["0 9 * * *"]
+
+[vars]
+ENVIRONMENT = "production"
+SITE_URL = "https://iszacka.dad"
+EMAIL_FROM = "stork@iszacka.dad"
+EMAIL_FROM_NAME = "The Stork at iszacka.dad"
+EMAIL_REPLY_FROM = "answer@iszacka.dad"
+# Self-imposed daily send cap (Resend's free plan allows 100/day; keep headroom).
+EMAIL_DAILY_LIMIT = "90"
+DNS_RECORD_NAME = "answer.iszacka.dad"
+ZONE_NAME = "iszacka.dad"
+# TURNSTILE_SITE_KEY is a Worker secret in production (see the header), not a var.
+
+[[d1_databases]]
+binding = "DB"
+database_name = "iszackadad"
+database_id = "PLACEHOLDER_D1_ID"
+migrations_dir = "migrations"
+
+[[durable_objects.bindings]]
+name = "WAITING_ROOM"
+class_name = "WaitingRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WaitingRoom"]
+
+[[workflows]]
+binding = "ANNOUNCE"
+name = "iszacka-dad-announce"
+class_name = "AnnounceWorkflow"
+
+[browser]
+binding = "BROWSER"
+
+[version_metadata]
+binding = "CF_VERSION"
+
+# Rate limiters. namespace_id is any account-unique positive integer.
+[[ratelimits]]
+name = "RL_FORMS"
+namespace_id = "41001"
+simple = { limit = 10, period = 60 }
+
+[[ratelimits]]
+name = "RL_API"
+namespace_id = "41002"
+simple = { limit = 120, period = 60 }
+
+[[ratelimits]]
+name = "RL_EMAIL"
+namespace_id = "41003"
+simple = { limit = 5, period = 60 }
+
+# ── Preview (per-PR deploys to *.workers.dev) ───────────────────────────────
+# Same code with a separate throwaway D1, no cron and Turnstile test keys. Previews
+# are public, so there is no admin password here: preview.yml stores the
+# PREVIEW_ADMIN_PASSWORD GitHub secret as the ADMIN_PASSWORD Worker secret (without
+# it, preview admin is off). No Browser Rendering either (it shares the account's
+# limits with production; /og.png falls back to the static cards), and the
+# rate limiters have their own namespaces so a preview can't use up production's.
+# CI deploys it with `--env preview --name <worker>-pr<N>`.
+[env.preview]
+routes = []
+triggers = { crons = [] }
+
+[env.preview.vars]
+ENVIRONMENT = "preview"
+SITE_URL = "https://iszacka.dad"
+EMAIL_FROM = "stork@iszacka.dad"
+EMAIL_FROM_NAME = "The Stork at iszacka.dad (preview)"
+EMAIL_REPLY_FROM = "answer@iszacka.dad"
+EMAIL_DAILY_LIMIT = "90"
+DNS_RECORD_NAME = ""
+ZONE_NAME = "iszacka.dad"
+# Cloudflare's always-pass Turnstile test keys.
+TURNSTILE_SITE_KEY = "1x00000000000000000000AA"
+TURNSTILE_SECRET_KEY = "1x0000000000000000000000000000000AA"
+
+[[env.preview.d1_databases]]
+binding = "DB"
+database_name = "iszackadad_preview"
+database_id = "PLACEHOLDER_D1_PREVIEW_ID"
+migrations_dir = "migrations"
+
+[[env.preview.durable_objects.bindings]]
+name = "WAITING_ROOM"
+class_name = "WaitingRoom"
+
+[[env.preview.workflows]]
+binding = "ANNOUNCE"
+name = "iszacka-dad-announce-preview"
+class_name = "AnnounceWorkflow"
+
+[env.preview.version_metadata]
+binding = "CF_VERSION"
+
+[[env.preview.ratelimits]]
+name = "RL_FORMS"
+namespace_id = "42001"
+simple = { limit = 10, period = 60 }
+
+[[env.preview.ratelimits]]
+name = "RL_API"
+namespace_id = "42002"
+simple = { limit = 120, period = 60 }
+
+[[env.preview.ratelimits]]
+name = "RL_EMAIL"
+namespace_id = "42003"
+simple = { limit = 5, period = 60 }

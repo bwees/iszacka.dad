@@ -1,0 +1,291 @@
+// OWNER: frontend agent. Shared HTML shell for every page.
+//
+// CONTRACT (must stay stable; other modules call it):
+//   renderPage(c, opts) → Promise<Response>
+// The shell provides <head> (meta, OG tags, favicon, manifest, styles), the site
+// header/nav, <main> with `opts.body`, the footer, and loads /app.js on every page.
+// Pages pass data to client JS via data-* attributes; inline <script> is blocked by CSP.
+
+import type { Context } from 'hono';
+import { html, raw } from 'hono/html';
+import type { HtmlEscapedString } from 'hono/utils/html';
+import type { ContentfulStatusCode } from 'hono/utils/http-status';
+import type { AppEnv, SiteState, Status } from '../types';
+import { STATUSES } from '../types';
+import { SITE_NAME, STATUS_COPY, siteUrl } from './site';
+
+export type Html = HtmlEscapedString | Promise<HtmlEscapedString>;
+
+export interface PageOptions {
+	/** Page title. The shell appends " · Is Zack a Dad?" (except on the homepage). */
+	title: string;
+	description?: string;
+	body: Html;
+	/** Canonical path, e.g. '/pool'. Defaults to the request path. */
+	path?: string;
+	/** Extra tags for <head>. */
+	head?: Html;
+	/** Extra module scripts to load (same-origin paths, e.g. '/push.js'). */
+	scripts?: string[];
+	/** Load the Turnstile script (set when the page renders turnstileWidget()). */
+	turnstile?: boolean;
+	noindex?: boolean;
+	/** HTTP status code (default 200). */
+	status?: number;
+	/** Extra class on <body>. */
+	bodyClass?: string;
+	/** Hide the site header/footer (embeds, printables, OG cards). */
+	bare?: boolean;
+}
+
+interface NavLink {
+	href: string;
+	label: string;
+}
+
+/** Header navigation. */
+export const NAV_LINKS: readonly NavLink[] = [
+	{ href: '/', label: 'Home' },
+	{ href: '/updates', label: 'Updates' },
+	{ href: '/pool', label: 'Pool' },
+	{ href: '/status', label: 'Status' },
+	{ href: '/stats', label: 'Stats' },
+	{ href: '/everything', label: 'Get notified' },
+];
+
+/** Footer directory: every public page in the URL map. */
+export const FOOTER_SECTIONS: ReadonlyArray<{ title: string; links: readonly NavLink[] }> = [
+	{
+		title: 'The answer',
+		links: [
+			{ href: '/', label: 'The answer itself' },
+			{ href: '/updates', label: 'Updates' },
+			{ href: '/status', label: 'Status page' },
+			{ href: '/stats', label: 'Anxiety analytics' },
+			{ href: '/ledger', label: 'The Dad Ledger' },
+		],
+	},
+	{
+		title: 'Join in',
+		links: [
+			{ href: '/pool', label: 'Baby pool' },
+			{ href: '/ready', label: 'Dad readiness' },
+			{ href: '/wall', label: 'Congratulations wall' },
+			{ href: '/names', label: 'Name suggestion box' },
+		],
+	},
+	{
+		title: 'Get notified',
+		links: [
+			{ href: '/everything', label: 'Every possible way' },
+			{ href: '/feed.xml', label: 'RSS' },
+			{ href: '/atom.xml', label: 'Atom' },
+			{ href: '/feed.json', label: 'JSON Feed' },
+			{ href: '/calendar.ics', label: 'Calendar (iCal)' },
+		],
+	},
+	{
+		title: 'For machines',
+		links: [
+			{ href: '/api', label: 'API' },
+			{ href: '/openapi.json', label: 'OpenAPI' },
+			{ href: '/llms.txt', label: 'llms.txt' },
+			{ href: '/humans.txt', label: 'humans.txt' },
+			{ href: '/.well-known/security.txt', label: 'security.txt' },
+		],
+	},
+	{
+		title: 'For the fridge',
+		links: [
+			{ href: '/certificate', label: 'Certificate' },
+			{ href: '/poster', label: 'Fridge poster' },
+		],
+	},
+];
+
+/** Used when a page renders before (or without) the root middleware loading state, e.g. on a D1 outage. */
+const FALLBACK_STATE: SiteState = { status: 'no', statusChangedAt: new Date(0).toISOString(), dueDate: null };
+
+/** The current state, tolerating it being missing (error pages rendered before the middleware ran). */
+export function pageState(c: Context<AppEnv>): SiteState {
+	try {
+		return c.get('state') ?? FALLBACK_STATE;
+	} catch {
+		return FALLBACK_STATE;
+	}
+}
+
+/** Short build identifier from the version metadata binding, or null in environments without it. */
+export function buildId(env: Partial<Env> | undefined): { id: string; tag: string | null; timestamp: string | null } | null {
+	try {
+		const meta = env?.CF_VERSION;
+		if (!meta || typeof meta !== 'object') return null;
+		const id = typeof meta.id === 'string' ? meta.id.slice(0, 8) : '';
+		const tag = typeof meta.tag === 'string' && meta.tag.trim() ? meta.tag.trim().slice(0, 40) : null;
+		const timestamp = typeof meta.timestamp === 'string' && meta.timestamp ? meta.timestamp : null;
+		if (!id && !tag) return null;
+		return { id: id || 'unknown', tag, timestamp };
+	} catch {
+		return null;
+	}
+}
+
+/** Static per-status copy for /app.js (it has no other way to know the words). */
+function clientCopyJson(): string {
+	const copy = Object.fromEntries(
+		STATUSES.map((s: Status) => {
+			const { word, short, headline, sentence, emoji, header } = STATUS_COPY[s];
+			return [s, { word, short, headline, sentence, emoji, header }];
+		}),
+	);
+	// The values are constants, but escape `<` anyway so nothing can ever close the script element.
+	return JSON.stringify({ siteName: SITE_NAME, copy }).replace(/</g, '\\u003c');
+}
+
+/**
+ * The social preview image URL, versioned by the status and when it last changed.
+ * Facebook, WhatsApp, X, Slack and friends cache og:image by URL and ignore max-age,
+ * so an unversioned /og.png would keep showing the old answer after the flip. The
+ * /og.png route matches on the path only, so the query string is just a cache key.
+ * (No daily component: the cron re-renders at 09:00 UTC, not at London midnight.)
+ */
+export function ogImageUrl(base: string, state: Pick<SiteState, 'status' | 'statusChangedAt'>): string {
+	const changed = Date.parse(state.statusChangedAt);
+	return `${base}/og.png?v=${state.status}-${Number.isNaN(changed) ? 0 : changed}`;
+}
+
+function isCurrent(linkHref: string, path: string): boolean {
+	if (linkHref === '/') return path === '/';
+	return path === linkHref || path.startsWith(`${linkHref}/`);
+}
+
+function safeSameOriginScript(src: string): boolean {
+	return src.startsWith('/') && !src.startsWith('//');
+}
+
+export async function renderPage(c: Context<AppEnv>, opts: PageOptions): Promise<Response> {
+	const state = pageState(c);
+	const copy = STATUS_COPY[state.status];
+	const requestPath = (() => {
+		try {
+			return new URL(c.req.url).pathname;
+		} catch {
+			return '/';
+		}
+	})();
+	const path = opts.path ?? requestPath;
+	const isHome = path === '/';
+	const fullTitle = isHome ? opts.title : `${opts.title} · ${SITE_NAME}`;
+	const description = opts.description ?? copy.sentence;
+	const base = siteUrl(c.env ?? {});
+	const build = buildId(c.env);
+	const scripts = (opts.scripts ?? []).filter(safeSameOriginScript);
+	const bodyClasses = [opts.bodyClass ?? '', opts.bare ? 'is-bare' : '', isHome ? 'page-home' : ''].filter(Boolean).join(' ');
+	const ogImage = ogImageUrl(base, state);
+
+	const header = html`<header class="site-header">
+	<div class="wrap header-inner">
+		<a href="/" class="brand"${isHome ? raw(' aria-current="page"') : ''}>
+			<svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><path d="M16 3C10 3 5 12 5 19a11 11 0 0 0 22 0C27 12 22 3 16 3Z"/></svg>
+			<span class="brand-name">${SITE_NAME}</span>
+			<span class="brand-answer" data-live="word">${copy.word}</span>
+		</a>
+		<nav class="site-nav" aria-label="Main">
+			<ul>
+				${NAV_LINKS.map(
+					(l) =>
+						html`<li><a href="${l.href}"${isCurrent(l.href, path) ? raw(' aria-current="page"') : ''}${l.href === '/everything' ? raw(' class="nav-cta"') : ''}>${l.label}</a></li>`,
+				)}
+			</ul>
+		</nav>
+	</div>
+</header>`;
+
+	const footer = html`<footer class="site-footer">
+	<div class="wrap">
+		<div class="footer-top">
+			<p class="footer-answer"><span class="kicker">Current answer</span> <span class="footer-sentence" data-live="sentence">${copy.sentence}</span></p>
+			<a class="btn btn-ghost" href="/everything">Tell me the moment it changes</a>
+		</div>
+		<nav class="footer-grid" aria-label="Everything else">
+			${FOOTER_SECTIONS.map(
+				(s) => html`<div class="footer-col">
+					<h2 class="kicker">${s.title}</h2>
+					<ul>
+						${s.links.map((l) => html`<li><a href="${l.href}">${l.label}</a></li>`)}
+					</ul>
+				</div>`,
+			)}
+		</nav>
+		<div class="footer-meta tiny muted">
+			<p>
+				Build <code class="build-id" title="${build?.timestamp ? `Deployed ${build.timestamp}` : 'Local build'}">${build ? (build.tag ?? build.id) : 'local'}</code>
+				· Served by one Cloudflare Worker, a Durable Object, D1, a Workflow and a cron trigger. For a yes/no question.
+			</p>
+			<p>
+				No AI was consulted in determining the answer. No personal data about the baby is stored, shown or wanted.
+				Typeset in Anybody, Atkinson Hyperlegible Next and Martian Mono (<a href="/fonts/OFL-anybody.txt">OFL</a>).
+			</p>
+		</div>
+	</div>
+</footer>`;
+
+	const page = html`<!doctype html>
+<html lang="en-GB" data-status="${state.status}" data-page="${isHome ? 'home' : 'page'}" data-title-base="${fullTitle}" data-changed-at="${state.statusChangedAt}" data-due-date="${state.dueDate ?? ''}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>${fullTitle}</title>
+<meta name="description" content="${description}">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="${themeColour(state.status, 'light')}" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="${themeColour(state.status, 'dark')}" media="(prefers-color-scheme: dark)">
+${opts.noindex ? html`<meta name="robots" content="noindex, nofollow">` : ''}
+<link rel="canonical" href="${base}${path}">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="${SITE_NAME}">
+<meta property="og:locale" content="en_GB">
+<meta property="og:title" content="${fullTitle}">
+<meta property="og:description" content="${description}">
+<meta property="og:url" content="${base}${path}">
+<meta property="og:image" content="${ogImage}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="${`Is Zack a dad? ${copy.word}.`}">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="${fullTitle}">
+<meta name="twitter:description" content="${description}">
+<meta name="twitter:image" content="${ogImage}">
+<link rel="icon" href="/favicon-${state.status}.svg" type="image/svg+xml" data-favicon>
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="alternate" type="application/rss+xml" title="${SITE_NAME} (RSS)" href="/feed.xml">
+<link rel="alternate" type="application/atom+xml" title="${SITE_NAME} (Atom)" href="/atom.xml">
+<link rel="alternate" type="application/feed+json" title="${SITE_NAME} (JSON Feed)" href="/feed.json">
+<link rel="alternate" type="text/calendar" title="${SITE_NAME} (calendar)" href="/calendar.ics">
+<link rel="preload" href="/fonts/anybody-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/fonts/atkinson-next-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/styles.css">
+${opts.turnstile ? raw('<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>') : ''}
+<script type="module" src="/app.js"></script>
+${scripts.map((src) => html`<script type="module" src="${src}"></script>`)}
+<script type="application/json" id="site-copy">${raw(clientCopyJson())}</script>
+${opts.head ?? ''}
+</head>
+<body class="${bodyClasses}" data-status="${state.status}">
+<a class="skip-link" href="#main">Skip to the answer</a>
+<div class="sr-only" id="announcer" role="status" aria-live="polite" aria-atomic="true" data-announcer></div>
+${opts.bare ? '' : header}
+<main id="main" tabindex="-1">${opts.body}</main>
+${opts.bare ? '' : footer}
+</body>
+</html>`;
+	return c.html(page, (opts.status ?? 200) as ContentfulStatusCode);
+}
+
+/** Browser chrome colour per status and scheme. Mirrors --hero-bg in /styles.css. */
+export function themeColour(status: Status, scheme: 'light' | 'dark'): string {
+	if (status === 'soon') return '#ffb000';
+	if (status === 'yes') return scheme === 'dark' ? '#0e6b3a' : '#14864a';
+	return scheme === 'dark' ? '#12110e' : '#f1ece1';
+}

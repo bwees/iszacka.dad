@@ -1,0 +1,40 @@
+{
+  "id": "/",
+  "name": "Is Zack a Dad?",
+  "short_name": "Zack a Dad?",
+  "description": "The definitive, real-time, over-engineered answer to whether Zack is a dad yet.",
+  "lang": "en-GB",
+  "dir": "ltr",
+  "start_url": "/?source=pwa",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "any",
+  "theme_color": "#f1ece1",
+  "background_color": "#f1ece1",
+  "categories": ["entertainment", "lifestyle", "news"],
+  "prefer_related_applications": false,
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
+    { "src": "/icons/apple-touch-icon.png", "sizes": "180x180", "type": "image/png", "purpose": "any" },
+    { "src": "/favicon-no.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ],
+  "shortcuts": [
+    {
+      "name": "Baby pool",
+      "short_name": "Pool",
+      "description": "Guess when Zack becomes a dad.",
+      "url": "/pool?source=pwa-shortcut",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "Updates",
+      "short_name": "Updates",
+      "description": "Every update so far, mostly variations on \"no\".",
+      "url": "/updates?source=pwa-shortcut",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    }
+  ]
+}

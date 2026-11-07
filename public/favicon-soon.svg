@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>Is Zack a dad? Not yet: it is happening.</title>
+  <rect width="64" height="64" rx="14" fill="#ffb000"/>
+  <g transform="rotate(-20 22 16)">
+    <path d="M12 21C13 11.5 19 5 26 5s13 6.5 14 16l-4.5-3-4 4-4.5-4-4.5 4-4-4Z" fill="#f6f1e6" stroke="#17140f" stroke-width="2.6" stroke-linejoin="round"/>
+  </g>
+  <circle cx="32" cy="32" r="12" fill="#ffd23f" stroke="#17140f" stroke-width="2.6"/>
+  <circle cx="28" cy="30" r="1.9" fill="#17140f"/>
+  <circle cx="36" cy="30" r="1.9" fill="#17140f"/>
+  <path d="M29.5 34.5 32 38l2.5-3.5Z" fill="#f08a24" stroke="#17140f" stroke-width="1.6" stroke-linejoin="round"/>
+  <path d="M11 37l5.25 4.5 5.25-4.5 5.25 4.5L32 37l5.25 4.5L42.5 37l5.25 4.5L53 37c1 13-8 21-21 21S10 50 11 37Z" fill="#f6f1e6" stroke="#17140f" stroke-width="2.6" stroke-linejoin="round"/>
+</svg>

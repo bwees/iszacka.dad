@@ -1,0 +1,17 @@
+# Copy to .dev.vars for local development (`npm run dev`).
+ADMIN_PASSWORD=dev
+# Optional: Turnstile's always-pass test keys (production stores real ones as Worker secrets)
+# TURNSTILE_SITE_KEY=1x00000000000000000000AA
+# TURNSTILE_SECRET_KEY=1x0000000000000000000000000000000AA
+# Optional: a Resend API key, to really send email from dev (without one, sends fail cleanly)
+# RESEND_API_KEY=
+# Optional: any whsec_<base64> value, to test POST /api/resend/webhook with self-signed requests
+# RESEND_WEBHOOK_SECRET=
+# Local dev must never point at the public answer.iszacka.dad record: wrangler dev runs with
+# the production [vars], so a local status flip would rewrite the real record. The name is
+# overridden here for that reason. Without DNS_API_TOKEN the DNS sync is skipped entirely,
+# which is what you want for normal development.
+DNS_RECORD_NAME=dev-answer.iszacka.dad
+# Optional, and only to test the DNS sync itself: a token with DNS:Edit on the zone. It writes
+# DNS_RECORD_NAME above (dev-answer), never the production record.
+# DNS_API_TOKEN=
